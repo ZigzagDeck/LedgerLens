@@ -34,14 +34,16 @@ class ReconciliationConfig:
     GROQ_MODEL: str = "groq/compound"
     ENABLE_AI_ASSIST: bool = True
     GROQ_MAX_CALLS_PER_MINUTE: int = 25
-    GROQ_RETRY_ATTEMPTS: int = 2
-    GROQ_RETRY_BACKOFF_BASE: float = 0.5
+    # Three retries produce the documented 2s, 4s, 8s exponential backoff sequence.
+    GROQ_RETRY_ATTEMPTS: int = 3
+    GROQ_RETRY_BACKOFF_BASE: float = 2.0
 
     # Custom Data & Debug Mode Configuration
     LEDGERLENS_CUSTOM_DATA_DIR: str = "data/custom"
     LEDGERLENS_DEBUG_MODE: bool = False
 
-    # Schema column definitions
+    # Schema column definitions. Some human-readable fields are optional at runtime,
+    # but the canonical generated/exported schema includes all of these columns.
     LEDGER_COLUMNS: List[str] = field(
         default_factory=lambda: [
             "order_id",

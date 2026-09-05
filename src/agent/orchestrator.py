@@ -1,27 +1,21 @@
 """Reconciliation Agent Orchestrator managing the stateful agent execution loop."""
 
 import uuid
-from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Any, List, Optional
 import pandas as pd
 
-from src.agent.models import (
-    CaseState,
-    ReconciliationCase,
-    ActionType,
-    AuditEvent,
-)
+from src.agent.models import CaseState, ReconciliationCase, ActionType
 from src.agent.policy import PolicyEngine
 from src.agent.actions import ActionService
 from src.agent.investigator import ExceptionInvestigator
 from src.reconciliation import reconcile
+from src.config import ReconciliationConfig, CONFIG
 from src.services.finance_controller import _classify_exception
 
 
 @dataclass
 class AgentRunSummary:
-    """Comprehensive summary produced by a full ReconciliationAgent execution loop."""
     run_id: str
     batch_status: str
     total_cases: int = 0
@@ -40,11 +34,7 @@ class AgentRunSummary:
 
 
 class ReconciliationAgent:
-    """Bounded, production-minded Financial Reconciliation Agent.
-
-    Executes the full agent loop:
-    OBSERVE -> NORMALIZE -> RECONCILE -> INVESTIGATE -> POLICY CHECK -> ACT -> VERIFY -> AUDIT
-    """
+    """Bounded reconciliation workflow: observe -> normalize -> reconcile -> investigate -> policy -> act -> verify -> audit."""
 
     def __init__(
         self,
@@ -62,44 +52,35 @@ class ReconciliationAgent:
         df_ledger: pd.DataFrame,
         df_bank: pd.DataFrame,
         run_id: Optional[str] = None,
+        config: ReconciliationConfig = CONFIG,
+        precomputed_results: Optional[pd.DataFrame] = None,
     ) -> AgentRunSummary:
-        """Run the complete agent pipeline over input ledger and bank datasets."""
-        if run_id is None:
-            run_id = f"RUN-{uuid.uuid4().hex[:8].upper()}"
-
-        # 1. OBSERVE & NORMALIZE: Run underlying deterministic matching core
-        df_results = reconcile(df_ledger, df_bank)
+        """Execute the full agent pipeline using the caller's exact reconciliation config/results."""
+        run_id = run_id or f"RUN-{uuid.uuid4().hex[:8].upper()}"
+        df_results = precomputed_results.copy() if precomputed_results is not None else reconcile(df_ledger, df_bank, config=config)
         self.cases.clear()
 
-        # Build bank record lookup keyed by utr_reference for O(1) row retrieval
-        if "utr_reference" in df_bank.columns:
-            bank_lookup: dict = df_bank.set_index("utr_reference").to_dict("index")
-        else:
-            bank_lookup = {}
+        ledger_lookup = (
+            df_ledger.set_index("order_id").to_dict("index") if "order_id" in df_ledger.columns else {}
+        )
+        bank_lookup = (
+            df_bank.set_index("utr_reference").to_dict("index") if "utr_reference" in df_bank.columns else {}
+        )
 
-        # 2. INITIALIZE CASES
-        for idx, row in df_results.iterrows():
+        for _, row in df_results.iterrows():
             l_id = str(row.get("ledger_id", ""))
             b_id = str(row.get("bank_id", ""))
-            case_id = f"CASE-{uuid.uuid4().hex[:8].upper()}"
-
             status = str(row.get("status", "UNMATCHED"))
             score = float(row.get("score", 0.0))
             rule = str(row.get("matching_rule", ""))
+            init_state = (
+                CaseState.MATCHED if status == "MATCHED"
+                else CaseState.AMBIGUOUS if status == "REVIEW"
+                else CaseState.UNMATCHED
+            )
 
-            # Map initial state
-            if status == "MATCHED":
-                init_state = CaseState.MATCHED
-            elif status == "REVIEW":
-                init_state = CaseState.AMBIGUOUS
-            else:
-                init_state = CaseState.UNMATCHED
-
-            # Classify exception type
             exc_obj = _classify_exception(row)
             exc_type = exc_obj.exception_type if exc_obj else "NONE"
-
-            # Reconstruct evidence dictionary
             evidence = {
                 "score": score,
                 "matching_rule": rule,
@@ -108,20 +89,21 @@ class ReconciliationAgent:
                 "decision_source": str(row.get("decision_source", "deterministic")),
             }
 
-            ledger_row_data = row.to_dict()
+            ledger_row_data = dict(ledger_lookup.get(l_id, {}))
+            if l_id:
+                ledger_row_data["order_id"] = l_id
+            ledger_row_data.update({
+                "ai_reason": str(row.get("ai_reason", "")),
+                "matching_rule": rule,
+                "decision_source": str(row.get("decision_source", "deterministic")),
+            })
 
-            # Populate bank_record with actual bank data (not just the bank_id string)
-            if b_id and b_id in bank_lookup:
-                bank_row_data = dict(bank_lookup[b_id])
-                bank_row_data["utr_reference"] = b_id  # ensure key is present
-            else:
-                bank_row_data = {"utr_reference": b_id, "bank_id": b_id}
+            bank_row_data = dict(bank_lookup.get(b_id, {}))
+            if b_id:
+                bank_row_data["utr_reference"] = b_id
 
-            # Populate candidates for REVIEW cases where AI hasn't already processed them.
-            # This activates the ExceptionInvestigator AI re-investigation path.
             decision_source = str(row.get("decision_source", "deterministic"))
             if status == "REVIEW" and decision_source != "groq" and b_id and b_id in bank_lookup:
-                # Construct a minimal candidate tuple: (score, b_id, bank_row, breakdown_dict)
                 candidates_for_case = [{
                     "score": score,
                     "utr_reference": b_id,
@@ -137,10 +119,10 @@ class ReconciliationAgent:
                 candidates_for_case = []
 
             case = ReconciliationCase(
-                case_id=case_id,
+                case_id=f"CASE-{uuid.uuid4().hex[:8].upper()}",
                 ledger_id=l_id,
                 bank_id=b_id,
-                state=init_state,
+                state=CaseState.NEW,
                 ledger_record=ledger_row_data,
                 bank_record=bank_row_data,
                 candidates=candidates_for_case,
@@ -150,105 +132,88 @@ class ReconciliationAgent:
                 evidence=evidence,
             )
 
+            case.transition_to(CaseState.INGESTING, "AGENT", "CASE_INGESTED")
+            case.transition_to(CaseState.NORMALIZING, "AGENT", "CASE_NORMALIZED")
+            case.transition_to(CaseState.RECONCILING, "RECONCILIATION_ENGINE", "CASE_RECONCILING")
             case.transition_to(
                 init_state,
                 actor="RECONCILIATION_ENGINE",
-                event_type="CASE_INITIALIZED",
-                details={"matching_rule": rule, "score": score},
+                event_type="RECONCILIATION_DECIDED",
+                details={"matching_rule": rule, "score": score, "status": status},
             )
-            self.cases[case_id] = case
+            self.cases[case.case_id] = case
 
-        # 3. INVESTIGATE & APPLY POLICY TO EACH CASE
-        resolved_cnt = 0
-        auto_resolved_cnt = 0
-        fee_adjusted_cnt = 0
-        pending_approval_cnt = 0
-        unmatched_cnt = 0
-        verified_cnt = 0
-        total_actions = 0
+        resolved_cnt = auto_resolved_cnt = fee_adjusted_cnt = 0
+        pending_approval_cnt = unmatched_cnt = verified_cnt = total_actions = 0
 
-        for case_id, case in self.cases.items():
+        for case in self.cases.values():
             if case.state == CaseState.MATCHED:
-                # High confidence auto-matched
                 policy_dec = self.policy_engine.evaluate(case)
                 case.policy_decision = policy_dec
-
                 if policy_dec.allowed and not policy_dec.requires_approval:
-                    exec_res, verif_res = self.action_service.execute_and_verify(
-                        case, action_type=policy_dec.action_type
-                    )
+                    _, verif_res = self.action_service.execute_and_verify(case, policy_dec.action_type)
                     resolved_cnt += 1
                     auto_resolved_cnt += 1
-                    if verif_res.verified:
-                        verified_cnt += 1
+                    verified_cnt += int(verif_res.verified)
                     total_actions += 1
+                else:
+                    case.transition_to(
+                        CaseState.ACTION_PENDING_APPROVAL,
+                        "POLICY_ENGINE",
+                        "APPROVAL_REQUIRED",
+                        {"reason": policy_dec.reason},
+                    )
+                    pending_approval_cnt += 1
 
             elif case.state == CaseState.UNMATCHED:
                 policy_dec = self.policy_engine.evaluate(case)
                 case.policy_decision = policy_dec
-                exec_res, verif_res = self.action_service.execute_and_verify(
-                    case, action_type=ActionType.MARK_UNMATCHED.value
+                _, verif_res = self.action_service.execute_and_verify(
+                    case, ActionType.MARK_UNMATCHED.value
                 )
                 unmatched_cnt += 1
-                if verif_res.verified:
-                    verified_cnt += 1
+                verified_cnt += int(verif_res.verified)
                 total_actions += 1
 
             elif case.state == CaseState.AMBIGUOUS:
-                # Transition to INVESTIGATING
-                case.transition_to(
-                    CaseState.INVESTIGATING,
-                    actor="AGENT",
-                    event_type="INVESTIGATION_STARTED",
-                )
-
-                # Investigate
+                case.transition_to(CaseState.INVESTIGATING, "AGENT", "INVESTIGATION_STARTED")
                 investigation = self.investigator.investigate(case)
                 case.investigation = investigation
                 case.transition_to(
                     CaseState.RECOMMENDATION_READY,
-                    actor="EXCEPTION_INVESTIGATOR",
-                    event_type="RECOMMENDATION_FORMULATED",
-                    details={"recommended_action": investigation.recommended_action},
+                    "EXCEPTION_INVESTIGATOR",
+                    "RECOMMENDATION_FORMULATED",
+                    {"recommended_action": investigation.recommended_action},
                 )
-
-                # Policy Check
                 policy_dec = self.policy_engine.evaluate(case, investigation)
                 case.policy_decision = policy_dec
 
                 if policy_dec.allowed and not policy_dec.requires_approval:
                     case.transition_to(
                         CaseState.POLICY_APPROVED,
-                        actor="POLICY_ENGINE",
-                        event_type="POLICY_APPROVED",
-                        details={"policy_code": policy_dec.policy_code},
+                        "POLICY_ENGINE",
+                        "POLICY_APPROVED",
+                        {"policy_code": policy_dec.policy_code},
                     )
-                    exec_res, verif_res = self.action_service.execute_and_verify(
-                        case, action_type=policy_dec.action_type
-                    )
-                    if policy_dec.action_type == ActionType.CREATE_FEE_ADJUSTMENT.value:
-                        fee_adjusted_cnt += 1
+                    _, verif_res = self.action_service.execute_and_verify(case, policy_dec.action_type)
+                    fee_adjusted_cnt += int(policy_dec.action_type == ActionType.CREATE_FEE_ADJUSTMENT.value)
                     resolved_cnt += 1
                     auto_resolved_cnt += 1
-                    if verif_res.verified:
-                        verified_cnt += 1
+                    verified_cnt += int(verif_res.verified)
                     total_actions += 1
                 else:
                     case.transition_to(
                         CaseState.ACTION_PENDING_APPROVAL,
-                        actor="POLICY_ENGINE",
-                        event_type="APPROVAL_REQUIRED",
-                        details={"reason": policy_dec.reason},
+                        "POLICY_ENGINE",
+                        "APPROVAL_REQUIRED",
+                        {"reason": policy_dec.reason},
                     )
                     pending_approval_cnt += 1
 
-        # Calculate metrics
         total = len(self.cases)
-        verif_rate = (verified_cnt / total_actions) if total_actions > 0 else 1.0
+        verif_rate = verified_cnt / total_actions if total_actions else 1.0
         batch_status = "READY_TO_CLOSE" if pending_approval_cnt == 0 else "REVIEW_REQUIRED"
-
         audit_cnt = sum(len(c.audit_history) for c in self.cases.values())
-
         summary_md = (
             f"### Agent Execution Summary for {run_id}\n\n"
             f"- **Total Cases**: {total}\n"

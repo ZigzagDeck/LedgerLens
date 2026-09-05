@@ -7,4 +7,6 @@ streamlit>=1.36.0
 pillow>=10.4.0
 fastapi>=0.110.0
 uvicorn>=0.30.0
+python-multipart>=0.0.9
 pytest>=8.0.0
+httpx>=0.27.0

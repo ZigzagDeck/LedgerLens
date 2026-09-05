@@ -1,27 +1,21 @@
+"""Interactive Streamlit dashboard for LedgerLens."""
+
+import io
 import os
 import sys
-import io
-import importlib
 import pandas as pd
 import streamlit as st
 
-# Ensure repository root is always in sys.path
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-import src.config
-importlib.reload(src.config)
-
 from src.config import ReconciliationConfig, CONFIG
 from src.reconciliation import reconcile
 from src.evaluation import evaluate_reconciliation
+from src.data_validation import validate_ledger_schema, validate_bank_schema
 from src.agent import ReconciliationAgent
 
-
-# -----------------------------------------------------------------------------
-# 1. Page Configuration & Aesthetic Styling
-# -----------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="LedgerLens — AI Finance Controller",
@@ -33,551 +27,308 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .main-header {
-        font-size: 2.2rem;
-        font-weight: 700;
-        margin-bottom: 0.2rem;
-    }
-    .sub-header {
-        font-size: 1.0rem;
-        opacity: 0.75;
-        margin-bottom: 1.5rem;
-    }
-    .headline-metric {
-        font-size: 1.05rem;
-        font-weight: 600;
-        background: rgba(20, 184, 166, 0.12);
-        border-radius: 8px;
-        border-left: 4px solid #14B8A6;
-        padding: 10px 16px;
-        margin: 10px 0;
-    }
-    div[data-testid="stMetric"], .stMetric {
-        background-color: rgba(128, 128, 128, 0.08) !important;
-        border-radius: 10px !important;
-        padding: 14px 16px !important;
-        border: 1px solid rgba(128, 128, 128, 0.18) !important;
-        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
-    }
-    div[data-testid="stMetric"]:hover {
-        border-color: rgba(20, 184, 166, 0.5) !important;
-    }
+    .main-header {font-size:2.2rem;font-weight:700;margin-bottom:.2rem}
+    .sub-header {font-size:1rem;opacity:.75;margin-bottom:1.3rem}
+    .headline {padding:10px 14px;border-radius:8px;background:rgba(20,184,166,.12);font-weight:600}
+    div[data-testid="stMetric"] {border:1px solid rgba(128,128,128,.18);border-radius:10px;padding:12px}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# -----------------------------------------------------------------------------
-# 2. Sidebar Configuration Controls
-# -----------------------------------------------------------------------------
+
+def _read_upload(uploaded) -> pd.DataFrame:
+    return pd.read_excel(uploaded, engine="openpyxl") if uploaded.name.lower().endswith(".xlsx") else pd.read_csv(uploaded)
+
+
+def _clear_run_state() -> None:
+    for key in ("reconciled_results", "eval_metrics", "agent_summary", "agent_audit"):
+        st.session_state.pop(key, None)
+
+
+def _load_samples(source_label: str) -> None:
+    ledger_path = os.path.join(ROOT_DIR, "data", "ledger.csv")
+    bank_path = os.path.join(ROOT_DIR, "data", "bank_statement.csv")
+    if not (os.path.exists(ledger_path) and os.path.exists(bank_path)):
+        st.error("Sample benchmark files are missing from data/.")
+        return
+    st.session_state["df_ledger"] = pd.read_csv(ledger_path)
+    st.session_state["df_bank"] = pd.read_csv(bank_path)
+    st.session_state["data_source_label"] = source_label
+    _clear_run_state()
+
+
+def _flatten_audit(summary) -> pd.DataFrame:
+    events = []
+    if not summary:
+        return pd.DataFrame()
+    for case in summary.cases:
+        for event in case.get("audit_history", []):
+            row = dict(event)
+            row["ledger_id"] = case.get("ledger_id", "")
+            row["bank_id"] = case.get("bank_id", "")
+            events.append(row)
+    if not events:
+        return pd.DataFrame()
+    return pd.DataFrame(events).sort_values("timestamp")
+
 
 st.sidebar.title("⚙️ Reconciliation Settings")
-st.sidebar.markdown("---")
-
 amt_tol = st.sidebar.number_input("Amount Tolerance (INR)", min_value=0.0, max_value=10.0, value=float(CONFIG.AMOUNT_TOLERANCE), step=0.01)
 date_win = st.sidebar.number_input("Date Window (Days)", min_value=0, max_value=30, value=int(CONFIG.DATE_WINDOW_DAYS), step=1)
-high_thresh = st.sidebar.slider("Auto-Match Threshold", min_value=0.50, max_value=0.95, value=float(CONFIG.HIGH_CONFIDENCE_THRESHOLD), step=0.01)
-review_thresh = st.sidebar.slider("Review Threshold", min_value=0.10, max_value=0.70, value=float(CONFIG.REVIEW_THRESHOLD), step=0.01)
+high_thresh = st.sidebar.slider("Auto-Match Threshold", 0.50, 0.95, float(CONFIG.HIGH_CONFIDENCE_THRESHOLD), 0.01)
+review_thresh = st.sidebar.slider("Review Threshold", 0.10, 0.70, float(CONFIG.REVIEW_THRESHOLD), 0.01)
 enable_ai = st.sidebar.checkbox("Enable Groq AI Assistance", value=bool(CONFIG.ENABLE_AI_ASSIST))
+calls_per_min = st.sidebar.number_input("Max Groq Calls / Min", min_value=5, max_value=60, value=int(CONFIG.GROQ_MAX_CALLS_PER_MINUTE), step=5)
 
 if enable_ai:
-    # Resolve initial key from os.environ or st.secrets
-    current_key = os.getenv("GROQ_API_KEY", "")
-    try:
-        if not current_key and hasattr(st, "secrets") and "GROQ_API_KEY" in st.secrets:
-            current_key = str(st.secrets["GROQ_API_KEY"]).strip()
-    except Exception:
-        pass
-
-    user_groq_key = st.sidebar.text_input(
+    configured_key = st.session_state.get("ledgerlens_groq_api_key", "")
+    if not configured_key:
+        try:
+            configured_key = str(st.secrets.get("GROQ_API_KEY", ""))
+        except Exception:
+            configured_key = ""
+    entered_key = st.sidebar.text_input(
         "Groq API Key (Live Inference)",
-        value=current_key,
+        value=configured_key,
         type="password",
-        help="Enter your Groq API key (starts with gsk_...) for live AI assistance.",
+        help="Stored only in this Streamlit session. Missing keys safely route ambiguous cases to REVIEW.",
     )
-    if user_groq_key and user_groq_key.strip().startswith("gsk_"):
-        os.environ["GROQ_API_KEY"] = user_groq_key.strip()
-        st.sidebar.caption("🟢 Live Groq AI: Key configured")
-    elif user_groq_key:
-        os.environ["GROQ_API_KEY"] = user_groq_key.strip()
-        st.sidebar.caption("🟡 Key configured (format: gsk_...)")
+    st.session_state["ledgerlens_groq_api_key"] = entered_key.strip()
+    if entered_key.strip():
+        st.sidebar.caption("🟢 Live Groq key configured for this session")
     else:
-        st.sidebar.caption("⚪ No Key: Ambiguous cases safely default to REVIEW")
-
-    calls_per_min = st.sidebar.number_input(
-        "Max Groq Calls / Min",
-        min_value=5,
-        max_value=60,
-        value=int(getattr(CONFIG, "GROQ_MAX_CALLS_PER_MINUTE", 25)),
-        step=5,
-        help="Rate limit threshold for Groq API calls to avoid 429 errors.",
-    )
+        st.sidebar.caption("⚪ No key: ambiguous cases safely default to REVIEW")
 else:
-    calls_per_min = 25
+    st.session_state.pop("ledgerlens_groq_api_key", None)
 
-os.environ["GROQ_MAX_CALLS_PER_MINUTE"] = str(calls_per_min)
-try:
-    from src.ai_matcher import get_rate_limiter
-    get_rate_limiter().update_limit(int(calls_per_min))
-except Exception:
-    pass
+run_mode = st.sidebar.radio("Evaluation Mode", ["Standard (Live Data)", "Benchmark (Ground Truth)"])
+is_benchmark = run_mode.startswith("Benchmark")
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Mode**")
-run_mode = st.sidebar.radio(
-    "Evaluation Mode",
-    ["Standard (Live Data)", "Benchmark (Ground Truth)"],
-    index=0,
-    help="Standard Mode reconciles uploaded or sample data. Benchmark Mode evaluates against canonical ground-truth data with Precision, Recall, F1, and confusion matrix.",
+user_config = ReconciliationConfig(
+    AMOUNT_TOLERANCE=float(amt_tol),
+    DATE_WINDOW_DAYS=int(date_win),
+    HIGH_CONFIDENCE_THRESHOLD=float(high_thresh),
+    REVIEW_THRESHOLD=float(review_thresh),
+    ENABLE_AI_ASSIST=bool(enable_ai),
+    GROQ_MAX_CALLS_PER_MINUTE=int(calls_per_min),
 )
-is_benchmark_mode = run_mode.startswith("Benchmark")
 
-# Build user configuration safely to prevent unexpected keyword argument TypeError
-config_kwargs = {
-    "AMOUNT_TOLERANCE": amt_tol,
-    "DATE_WINDOW_DAYS": date_win,
-    "HIGH_CONFIDENCE_THRESHOLD": high_thresh,
-    "REVIEW_THRESHOLD": review_thresh,
-    "ENABLE_AI_ASSIST": enable_ai,
-}
-dataclass_fields = getattr(ReconciliationConfig, "__dataclass_fields__", {})
-if "GROQ_MAX_CALLS_PER_MINUTE" in dataclass_fields:
-    config_kwargs["GROQ_MAX_CALLS_PER_MINUTE"] = int(calls_per_min)
-
-user_config = ReconciliationConfig(**config_kwargs)
-
-sample_ledger_path = os.path.join(ROOT_DIR, "data", "ledger.csv")
-sample_bank_path = os.path.join(ROOT_DIR, "data", "bank_statement.csv")
-sample_answer_key_path = os.path.join(ROOT_DIR, "data", "answer_key.csv")
-
-# -----------------------------------------------------------------------------
-# 3. Session State Management & Mode-Toggle Handling
-# -----------------------------------------------------------------------------
-
-if "active_mode" not in st.session_state:
+if st.session_state.get("active_mode") != run_mode:
     st.session_state["active_mode"] = run_mode
-    st.session_state["uploader_key"] = 0
-
-# Reactive Mode-Switching: immediately clears stale results and prepares the target mode environment
-if st.session_state["active_mode"] != run_mode:
-    st.session_state["active_mode"] = run_mode
-    st.session_state.pop("reconciled_results", None)
-    st.session_state.pop("eval_metrics", None)
-    st.session_state.pop("agent_summary", None)
-    st.session_state["uploader_key"] = st.session_state.get("uploader_key", 0) + 1
-
-    if is_benchmark_mode:
-        # Automatically load canonical benchmark data
-        if os.path.exists(sample_ledger_path) and os.path.exists(sample_bank_path):
-            st.session_state["df_ledger"] = pd.read_csv(sample_ledger_path)
-            st.session_state["df_bank"] = pd.read_csv(sample_bank_path)
-            st.session_state["data_source"] = "benchmark"
-            st.session_state["data_source_label"] = "Canonical Benchmark Dataset (data/)"
-        else:
-            st.session_state.pop("df_ledger", None)
-            st.session_state.pop("df_bank", None)
-            st.session_state.pop("data_source", None)
-            st.session_state.pop("data_source_label", None)
+    _clear_run_state()
+    if is_benchmark:
+        _load_samples("Canonical Benchmark Dataset (data/)")
     else:
-        # Switch back to clean Standard mode
-        st.session_state.pop("df_ledger", None)
-        st.session_state.pop("df_bank", None)
-        st.session_state.pop("data_source", None)
-        st.session_state.pop("data_source_label", None)
-        st.session_state.pop("uploaded_filenames", None)
-
+        for key in ("df_ledger", "df_bank", "data_source_label", "uploaded_filenames"):
+            st.session_state.pop(key, None)
     st.rerun()
-
-# -----------------------------------------------------------------------------
-# 4. Main Header & Data Input Controls
-# -----------------------------------------------------------------------------
 
 st.markdown('<div class="main-header">LedgerLens — AI Finance Controller</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Deterministic Multi-Tier Matching & Guardrailed AI Assistance</div>', unsafe_allow_html=True)
 
-if is_benchmark_mode:
-    st.markdown(
-        """
-        <div style="padding: 14px 18px; border-radius: 10px; background: rgba(20, 184, 166, 0.12); border: 1px solid rgba(20, 184, 166, 0.35); margin-bottom: 18px;">
-            <div style="font-weight: 700; font-size: 1.12rem; color: #14B8A6; margin-bottom: 4px;">🎯 Benchmark Mode Active: Ground-Truth Evaluation</div>
-            <div style="font-size: 0.95rem; opacity: 0.9;">
-                Reconciliation is benchmarked against canonical datasets (<code>data/ledger.csv</code> and <code>data/bank_statement.csv</code>)
-                and evaluated against <code>data/answer_key.csv</code> to measure Precision, Recall, F1-Score, and Confusion Matrix across 225 edge-case scenarios.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    col_bm1, col_bm2 = st.columns([2, 4])
-    with col_bm1:
-        if st.button("🔄 Reload Benchmark Dataset", use_container_width=True, help="Reload fresh copies of canonical benchmark data"):
-            if os.path.exists(sample_ledger_path) and os.path.exists(sample_bank_path):
-                st.session_state["df_ledger"] = pd.read_csv(sample_ledger_path)
-                st.session_state["df_bank"] = pd.read_csv(sample_bank_path)
-                st.session_state["data_source"] = "benchmark"
-                st.session_state["data_source_label"] = "Canonical Benchmark Dataset (data/)"
-                st.session_state.pop("reconciled_results", None)
-                st.session_state.pop("eval_metrics", None)
-                st.session_state.pop("agent_summary", None)
-                st.rerun()
-
-    # Ensure benchmark data is loaded if not already in session state
+if is_benchmark:
+    st.info("🎯 Benchmark mode uses the canonical data/ datasets and evaluates final decisions against data/answer_key.csv.")
+    if st.button("🔄 Reload Benchmark Dataset"):
+        _load_samples("Canonical Benchmark Dataset (data/)")
+        st.rerun()
     if "df_ledger" not in st.session_state or "df_bank" not in st.session_state:
-        if os.path.exists(sample_ledger_path) and os.path.exists(sample_bank_path):
-            st.session_state["df_ledger"] = pd.read_csv(sample_ledger_path)
-            st.session_state["df_bank"] = pd.read_csv(sample_bank_path)
-            st.session_state["data_source"] = "benchmark"
-            st.session_state["data_source_label"] = "Canonical Benchmark Dataset (data/)"
-
+        _load_samples("Canonical Benchmark Dataset (data/)")
 else:
-    # Standard Mode: File uploaders + Functional Sample Data loading + Reset buttons
-    u_key = st.session_state.get("uploader_key", 0)
-    col_u1, col_u2 = st.columns(2)
-    with col_u1:
-        ledger_file = st.file_uploader(
-            "Upload Internal Ledger (CSV or XLSX)",
-            type=["csv", "xlsx"],
-            key=f"ledger_uploader_{u_key}",
-        )
-    with col_u2:
-        bank_file = st.file_uploader(
-            "Upload Bank Statement (CSV or XLSX)",
-            type=["csv", "xlsx"],
-            key=f"bank_uploader_{u_key}",
-        )
+    c1, c2 = st.columns(2)
+    with c1:
+        ledger_file = st.file_uploader("Upload Internal Ledger (CSV or XLSX)", type=["csv", "xlsx"])
+    with c2:
+        bank_file = st.file_uploader("Upload Bank Statement (CSV or XLSX)", type=["csv", "xlsx"])
 
-    # Handle file uploads
     if ledger_file and bank_file:
-        current_pair = (ledger_file.name, bank_file.name)
-        if st.session_state.get("uploaded_filenames") != current_pair:
+        pair = (ledger_file.name, bank_file.name)
+        if st.session_state.get("uploaded_filenames") != pair:
             try:
-                df_l = pd.read_excel(ledger_file, engine="openpyxl") if ledger_file.name.endswith(".xlsx") else pd.read_csv(ledger_file)
-                df_b = pd.read_excel(bank_file, engine="openpyxl") if bank_file.name.endswith(".xlsx") else pd.read_csv(bank_file)
-                st.session_state["df_ledger"] = df_l
-                st.session_state["df_bank"] = df_b
-                st.session_state["data_source"] = "uploaded"
+                st.session_state["df_ledger"] = _read_upload(ledger_file)
+                st.session_state["df_bank"] = _read_upload(bank_file)
                 st.session_state["data_source_label"] = f"Uploaded ({ledger_file.name}, {bank_file.name})"
-                st.session_state["uploaded_filenames"] = current_pair
-                st.session_state.pop("reconciled_results", None)
-                st.session_state.pop("eval_metrics", None)
-                st.session_state.pop("agent_summary", None)
+                st.session_state["uploaded_filenames"] = pair
+                _clear_run_state()
                 st.rerun()
-            except Exception as err:
-                st.error(f"Error parsing uploaded files: {err}")
+            except Exception as exc:
+                st.error(f"Could not parse uploaded files: {exc}")
 
-    col_btn1, col_btn2, col_spacer = st.columns([1.8, 1.8, 3.4])
-    with col_btn1:
-        if st.button("📁 Load Sample Datasets", use_container_width=True, help="Load sample datasets from data/ for quick exploration"):
-            if os.path.exists(sample_ledger_path) and os.path.exists(sample_bank_path):
-                st.session_state["df_ledger"] = pd.read_csv(sample_ledger_path)
-                st.session_state["df_bank"] = pd.read_csv(sample_bank_path)
-                st.session_state["data_source"] = "sample"
-                st.session_state["data_source_label"] = "Sample Datasets (data/ledger.csv & data/bank_statement.csv)"
-                st.session_state.pop("uploaded_filenames", None)
-                st.session_state.pop("reconciled_results", None)
-                st.session_state.pop("eval_metrics", None)
-                st.session_state.pop("agent_summary", None)
-                st.rerun()
-            else:
-                st.error("Sample files data/ledger.csv or data/bank_statement.csv not found.")
-    with col_btn2:
-        if st.button("🔄 Reset / Clear Active Data", use_container_width=True, help="Clear loaded datasets, results, and reset upload fields"):
-            st.session_state.pop("df_ledger", None)
-            st.session_state.pop("df_bank", None)
-            st.session_state.pop("data_source", None)
-            st.session_state.pop("data_source_label", None)
-            st.session_state.pop("uploaded_filenames", None)
-            st.session_state.pop("reconciled_results", None)
-            st.session_state.pop("eval_metrics", None)
-            st.session_state.pop("agent_summary", None)
-            st.session_state["uploader_key"] = st.session_state.get("uploader_key", 0) + 1
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("📁 Load Sample Datasets", use_container_width=True):
+            _load_samples("Sample Datasets (data/)")
+            st.rerun()
+    with b2:
+        if st.button("🔄 Reset / Clear Active Data", use_container_width=True):
+            for key in ("df_ledger", "df_bank", "data_source_label", "uploaded_filenames"):
+                st.session_state.pop(key, None)
+            _clear_run_state()
             st.rerun()
 
-# -----------------------------------------------------------------------------
-# 5. Active Dataset Status & Preview Section
-# -----------------------------------------------------------------------------
 
 df_ledger = st.session_state.get("df_ledger")
 df_bank = st.session_state.get("df_bank")
-data_label = st.session_state.get("data_source_label", "")
 
 if df_ledger is not None and df_bank is not None:
-    st.success(f"✅ **Active Data Ready:** {data_label} · **Ledger:** {len(df_ledger):,} records · **Bank Statement:** {len(df_bank):,} records")
-    with st.expander("👁️ View Active Dataset Previews (First 5 Rows)", expanded=False):
-        c_prev1, c_prev2 = st.columns(2)
-        with c_prev1:
-            st.markdown(f"**Internal Ledger (`{len(df_ledger):,}` rows)**")
-            st.dataframe(df_ledger.head(5), use_container_width=True, hide_index=True)
-        with c_prev2:
-            st.markdown(f"**Bank Statement (`{len(df_bank):,}` rows)**")
-            st.dataframe(df_bank.head(5), use_container_width=True, hide_index=True)
-else:
-    if is_benchmark_mode:
-        st.warning("⚠️ Benchmark datasets not found in `data/`. Please ensure `data/ledger.csv` and `data/bank_statement.csv` are present.")
+    st.success(
+        f"✅ Active Data: {st.session_state.get('data_source_label', '')} · "
+        f"Ledger {len(df_ledger):,} rows · Bank {len(df_bank):,} rows"
+    )
+    with st.expander("👁️ View Active Dataset Previews"):
+        p1, p2 = st.columns(2)
+        p1.dataframe(df_ledger.head(5), use_container_width=True, hide_index=True)
+        p2.dataframe(df_bank.head(5), use_container_width=True, hide_index=True)
+
+    valid_l, errs_l = validate_ledger_schema(df_ledger, user_config)
+    valid_b, errs_b = validate_bank_schema(df_bank, user_config)
+    if not valid_l or not valid_b:
+        st.error("Dataset validation failed: " + "; ".join(errs_l + errs_b))
     else:
-        st.info("ℹ️ **No dataset active.** Upload your Ledger and Bank Statement above, or click **'📁 Load Sample Datasets'** to load sample data.")
-
-
-def validate_datasets(df_l: pd.DataFrame, df_b: pd.DataFrame) -> bool:
-    """Validate non-empty datasets and required schema columns."""
-    if df_l is None or df_b is None:
-        return False
-    if df_l.empty or df_b.empty:
-        st.error("Validation Error: One or both datasets are empty.")
-        return False
-
-    missing_l = [c for c in ["order_id", "amount", "order_date"] if c not in df_l.columns]
-    missing_b = [c for c in ["utr_reference", "credited_amount", "value_date"] if c not in df_b.columns]
-
-    if missing_l:
-        st.error(f"Validation Error: Ledger dataset missing required columns: {missing_l}")
-        return False
-    if missing_b:
-        st.error(f"Validation Error: Bank statement dataset missing required columns: {missing_b}")
-        return False
-
-    return True
-
-# -----------------------------------------------------------------------------
-# 6. Reconciliation Execution & KPI Dashboard
-# -----------------------------------------------------------------------------
-
-if validate_datasets(df_ledger, df_bank):
-    button_label = "🎯 Run Reconciliation & Benchmark Evaluation" if is_benchmark_mode else "🚀 Run Reconciliation Engine"
-    if st.button(button_label, type="primary", use_container_width=True):
-        with st.spinner("Executing Multi-Tier Deterministic & AI Reconciliation..."):
-            results = reconcile(df_ledger, df_bank, config=user_config)
-            st.session_state["reconciled_results"] = results
-            st.session_state["data_source"] = st.session_state.get("data_source", "uploaded")
-
-            # Execute agent workflow automatically so agent case intelligence is immediately active
-            try:
-                agent_inst = ReconciliationAgent()
-                summary_inst = agent_inst.observe_and_reconcile(df_ledger, df_bank)
-                st.session_state["agent_summary"] = summary_inst
-            except Exception as ag_err:
-                st.warning(f"Agent workflow notice: {ag_err}")
-
-            # In Benchmark mode, execute full ground-truth evaluation
-            if is_benchmark_mode and os.path.exists(sample_answer_key_path):
+        label = "🎯 Run Reconciliation & Benchmark Evaluation" if is_benchmark else "🚀 Run Reconciliation Engine"
+        if st.button(label, type="primary", use_container_width=True):
+            with st.spinner("Reconciling transactions..."):
                 try:
-                    eval_metrics = evaluate_reconciliation(
-                        data_dir=os.path.join(ROOT_DIR, "data"),
+                    results = reconcile(df_ledger, df_bank, config=user_config)
+                    agent = ReconciliationAgent()
+                    agent_summary = agent.observe_and_reconcile(
+                        df_ledger,
+                        df_bank,
                         config=user_config,
                         precomputed_results=results,
                     )
-                    st.session_state["eval_metrics"] = eval_metrics
-                except Exception as eval_err:
-                    st.warning(f"Ground truth evaluation notice: {eval_err}")
-                    st.session_state["eval_metrics"] = {}
-            else:
-                st.session_state["eval_metrics"] = {}
+                    st.session_state["reconciled_results"] = results
+                    st.session_state["agent_summary"] = agent_summary
+                    st.session_state["agent_audit"] = _flatten_audit(agent_summary)
+                    if is_benchmark:
+                        st.session_state["eval_metrics"] = evaluate_reconciliation(
+                            data_dir=os.path.join(ROOT_DIR, "data"),
+                            config=user_config,
+                            precomputed_results=results,
+                        )
+                    else:
+                        st.session_state["eval_metrics"] = {}
+                except Exception as exc:
+                    st.error(f"Reconciliation failed: {exc}")
+                else:
+                    st.rerun()
+else:
+    st.info("Load or upload a ledger and bank statement to begin.")
 
-        st.rerun()
 
 if "reconciled_results" in st.session_state:
     results = st.session_state["reconciled_results"]
-    eval_m = st.session_state.get("eval_metrics", {})
-    current_source = st.session_state.get("data_source", "unknown")
+    metrics = st.session_state.get("eval_metrics", {})
+    agent_summary = st.session_state.get("agent_summary")
+    audit_df = st.session_state.get("agent_audit", pd.DataFrame())
 
-    total_rows = len(results)
-    matched_cnt = len(results[results["status"] == "MATCHED"])
-    review_cnt = len(results[results["status"] == "REVIEW"])
-    unmatched_cnt = len(results[results["status"] == "UNMATCHED"])
-    ai_calls_cnt = len(results[results["decision_source"] == "groq"]) if "decision_source" in results.columns else 0
+    total = len(results)
+    matched = int((results["status"] == "MATCHED").sum())
+    review = int((results["status"] == "REVIEW").sum())
+    unmatched = int((results["status"] == "UNMATCHED").sum())
+    ai_calls = int((results["decision_source"] == "groq").sum())
 
     st.markdown("---")
-    st.markdown("### 📊 Reconciliation Performance Summary")
+    st.subheader("📊 Reconciliation Performance Summary")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Total Records", total)
+    k2.metric("Matched", matched)
+    k3.metric("Review Required", review)
+    k4.metric("Unmatched", unmatched)
+    k5.metric("AI Escalations", ai_calls)
 
-    if is_benchmark_mode:
-        st.caption("🎯 **Mode: Benchmark (Ground Truth)** — Reconciled and evaluated against canonical answer key")
-    elif current_source == "uploaded":
-        st.caption("📎 **Mode: Standard (Uploaded Live Data)** — Reconciled with multi-tier engine")
-    else:
-        st.caption("📁 **Mode: Standard (Sample Data)** — Reconciled with multi-tier engine")
+    if metrics:
+        st.markdown(f'<div class="headline">🎯 {metrics.get("headline", "")}</div>', unsafe_allow_html=True)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Pair Precision", f"{metrics.get('pair_precision', 0):.4f}")
+        m2.metric("Pair Recall", f"{metrics.get('pair_recall', 0):.4f}")
+        m3.metric("F1 Score", f"{metrics.get('f1_score', 0):.4f}")
+        m4.metric("Auto-Resolution Precision", f"{metrics.get('auto_resolution_precision', 0):.4f}")
 
-    pct_m = f" ({matched_cnt/total_rows*100:.1f}%)" if total_rows > 0 else ""
-    pct_r = f" ({review_cnt/total_rows*100:.1f}%)" if total_rows > 0 else ""
-    pct_u = f" ({unmatched_cnt/total_rows*100:.1f}%)" if total_rows > 0 else ""
-
-    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-    kpi1.metric("Total Records", f"{total_rows:,}")
-    kpi2.metric("Matched", f"{matched_cnt:,}{pct_m}")
-    kpi3.metric("Review Required", f"{review_cnt:,}{pct_r}")
-    kpi4.metric("Unmatched", f"{unmatched_cnt:,}{pct_u}")
-    kpi5.metric("AI Escalations", f"{ai_calls_cnt:,}", help="Ambiguous transactions evaluated via Groq compound LLM")
-
-    # Display ground truth metrics when in benchmark mode
-    if eval_m:
-        headline = eval_m.get("headline", "")
-        if headline:
-            st.markdown(f'<div class="headline-metric">🎯 {headline}</div>', unsafe_allow_html=True)
-
-        cm = eval_m.get("confusion_matrix", {})
-        fp_cnt = cm.get("FP", 0)
-        fn_cnt = cm.get("FN", 0)
-
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Pair Precision", f"{eval_m.get('pair_precision', 0):.4f}")
-        m2.metric("Pair Recall", f"{eval_m.get('pair_recall', 0):.4f}")
-        m3.metric("F1 Score", f"{eval_m.get('f1_score', 0):.4f}")
-        m4.metric("Auto-Res. Precision", f"{eval_m.get('auto_resolution_precision', 0):.4f}")
-        m5.metric("False Positives", fp_cnt)
-        m6.metric("False Negatives", fn_cnt)
-
-    # -------------------------------------------------------------------------
-    # 7. Detailed Results Tabs & Exception-First View
-    # -------------------------------------------------------------------------
-
-    tab_titles = (
-        ["🎯 Benchmark Evaluation", "🔍 Exception Summary", "🤖 Agent Activity & Trace", "✅ Matched", "⚠️ Review Required", "❌ Unmatched"]
-        if is_benchmark_mode
-        else ["🔍 Exception Summary", "🤖 Agent Activity & Trace", "✅ Matched", "⚠️ Review Required", "❌ Unmatched", "🎯 Benchmark Evaluation"]
-    )
-    all_tabs = st.tabs(tab_titles)
-
-    if is_benchmark_mode:
-        tab_eval, tab_exceptions, tab_agent, tab_matched, tab_review, tab_unmatched = all_tabs
-    else:
-        tab_exceptions, tab_agent, tab_matched, tab_review, tab_unmatched, tab_eval = all_tabs
-
-    cols_to_show = ["ledger_id", "bank_id", "status", "matching_rule", "score", "reason", "decision_source", "model_used"]
-    cols_exist = [c for c in cols_to_show if c in results.columns]
+    tabs = st.tabs(["🎯 Benchmark", "🔍 Exceptions", "🤖 Agent & Audit", "✅ Matched", "⚠️ Review", "❌ Unmatched"])
+    tab_eval, tab_exc, tab_agent, tab_matched, tab_review, tab_unmatched = tabs
 
     with tab_eval:
-        st.markdown("### 🎯 Ground Truth Benchmark Evaluation")
-        if eval_m:
-            st.markdown(f"**Benchmark Summary:** `{eval_m.get('headline', '')}`")
-
-            col_ev1, col_ev2, col_ev3, col_ev4 = st.columns(4)
-            col_ev1.metric("Pair Precision", f"{eval_m.get('pair_precision', 0):.4f}", help="True Positives / (True Positives + False Positives)")
-            col_ev2.metric("Pair Recall", f"{eval_m.get('pair_recall', 0):.4f}", help="True Positives / (True Positives + False Negatives)")
-            col_ev3.metric("F1 Score", f"{eval_m.get('f1_score', 0):.4f}", help="Harmonic Mean of Precision and Recall")
-            col_ev4.metric("Auto-Resolution Precision", f"{eval_m.get('auto_resolution_precision', 0):.4f}", help="Precision of deterministic rules before AI review")
-
-            st.markdown("#### ⚖️ Confusion Matrix")
-            cm = eval_m.get("confusion_matrix", {})
-            tp_val, fp_val = cm.get("TP", 0), cm.get("FP", 0)
-            fn_val, tn_val = cm.get("FN", 0), cm.get("TN", 0)
-
-            cm_html = f"""
-            <table style="width: 100%; border-collapse: collapse; margin: 10px 0 20px 0; text-align: center;">
-              <thead>
-                <tr style="background: rgba(128,128,128,0.12); font-weight: 600;">
-                  <th style="padding: 10px; border: 1px solid rgba(128,128,128,0.25); text-align: left;">Ground Truth \\ Engine Decision</th>
-                  <th style="padding: 10px; border: 1px solid rgba(128,128,128,0.25); color: #10B981;">MATCHED (Predicted)</th>
-                  <th style="padding: 10px; border: 1px solid rgba(128,128,128,0.25); color: #EF4444;">NON-MATCHED (Predicted)</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td style="padding: 10px; border: 1px solid rgba(128,128,128,0.25); font-weight: 600; text-align: left;">MATCHED (Actual)</td>
-                  <td style="padding: 10px; border: 1px solid rgba(128,128,128,0.25); background: rgba(16,185,129,0.12); font-weight: 700; font-size: 1.1rem; color: #10B981;">TP: {tp_val}</td>
-                  <td style="padding: 10px; border: 1px solid rgba(128,128,128,0.25); background: rgba(239,68,68,0.12); font-weight: 700; font-size: 1.1rem; color: #EF4444;">FN: {fn_val}</td>
-                </tr>
-                <tr>
-                  <td style="padding: 10px; border: 1px solid rgba(128,128,128,0.25); font-weight: 600; text-align: left;">NON-MATCHED (Actual)</td>
-                  <td style="padding: 10px; border: 1px solid rgba(128,128,128,0.25); background: rgba(239,68,68,0.12); font-weight: 700; font-size: 1.1rem; color: #EF4444;">FP: {fp_val}</td>
-                  <td style="padding: 10px; border: 1px solid rgba(128,128,128,0.25); background: rgba(16,185,129,0.12); font-weight: 700; font-size: 1.1rem; color: #10B981;">TN: {tn_val}</td>
-                </tr>
-              </tbody>
-            </table>
-            """
-            st.markdown(cm_html, unsafe_allow_html=True)
-
-            rates = eval_m.get("rates", {})
-            st.markdown("#### 📈 Operational Coverage & Safety Metrics")
+        if metrics:
+            cm = metrics.get("confusion_matrix", {})
+            cm_df = pd.DataFrame(
+                [[cm.get("TP", 0), cm.get("FN", 0)], [cm.get("FP", 0), cm.get("TN", 0)]],
+                index=["Actual MATCHED", "Actual NON-MATCHED"],
+                columns=["Predicted MATCHED", "Predicted NON-MATCHED"],
+            )
+            st.markdown("#### 2×2 Confusion Matrix")
+            st.dataframe(cm_df, use_container_width=True)
+            rates = metrics.get("rates", {})
             r1, r2, r3, r4 = st.columns(4)
             r1.metric("Automated Coverage", f"{rates.get('automated_coverage', 0)*100:.1f}%")
             r2.metric("Review Rate", f"{rates.get('review_rate', 0)*100:.1f}%")
             r3.metric("Deterministic Match Rate", f"{rates.get('deterministic_match_rate', 0)*100:.1f}%")
             r4.metric("AI Escalation Rate", f"{rates.get('ai_escalation_rate', 0)*100:.1f}%")
-
-            safety = eval_m.get("safety_checks", {})
-            st.caption(f"🔒 **Safety Audits:** One-to-One Conflicts: `{safety.get('duplicate_assignment_conflicts', 0)}` · Invalid AI Selections: `{safety.get('invalid_ai_selections', 0)}`")
-
-            with st.expander("📄 Export Raw Benchmark Metrics JSON"):
-                st.json(eval_m)
+            with st.expander("Raw benchmark metrics"):
+                st.json(metrics)
         else:
-            if is_benchmark_mode:
-                st.info("Click **'🎯 Run Reconciliation & Benchmark Evaluation'** above to compute ground-truth benchmark metrics.")
-            else:
-                st.info("Benchmark evaluation is available in **Benchmark (Ground Truth)** mode. Switch modes in the sidebar to benchmark against the canonical answer key.")
+            st.info("Switch to Benchmark mode and run reconciliation to calculate ground-truth metrics.")
 
-    with tab_exceptions:
-        st.markdown("### 🔍 Unreconciled Exceptions & Action Recommendations")
-        df_exc = results[results["status"].isin(["REVIEW", "UNMATCHED"])].copy()
-        if not df_exc.empty:
-            exc_cols = ["ledger_id", "bank_id", "status", "matching_rule", "score", "reason"]
-            exc_exist = [c for c in exc_cols if c in df_exc.columns]
-            df_exc["resolution_guidance"] = df_exc["matching_rule"].map({
-                "AMBIGUOUS_CANDIDATES": "Human review required",
-                "AI_REVIEW_REQUIRED": "AI inconclusive — manual check",
-                "SCORE_REVIEW": "Low confidence — verify manually",
-                "ONE_TO_ONE_CONFLICT": "Resolve duplicate claim",
-                "NO_CANDIDATE": "Missing counterparty — investigate",
+    with tab_exc:
+        exceptions = results[results["status"].isin(["REVIEW", "UNMATCHED"])].copy()
+        if exceptions.empty:
+            st.success("No unresolved exceptions.")
+        else:
+            guidance = {
+                "AMBIGUOUS_CANDIDATES": "Compare top candidates manually",
+                "AI_REVIEW_REQUIRED": "AI inconclusive — manual evidence check",
+                "SCORE_REVIEW": "Verify low-confidence evidence",
+                "ONE_TO_ONE_CONFLICT": "Resolve duplicate bank claim",
+                "NO_CANDIDATE": "Investigate missing settlement",
                 "LOW_SCORE": "No plausible match found",
-                "NO_MATCH": "Bank record without ledger entry",
-                "CURRENCY_MISMATCH": "Currency mismatch — verify",
-            }).fillna("Review required")
-            st.dataframe(df_exc[exc_exist + ["resolution_guidance"]], use_container_width=True, hide_index=True)
-        else:
-            st.success("No exceptions — all transactions reconciled successfully!")
+                "NO_MATCH": "Investigate unlinked bank deposit",
+                "CURRENCY_MISMATCH": "Verify currency/FX externally",
+            }
+            exceptions["resolution_guidance"] = exceptions["matching_rule"].map(guidance).fillna("Manual review required")
+            show = [c for c in ["ledger_id", "bank_id", "status", "matching_rule", "score", "reason", "resolution_guidance"] if c in exceptions.columns]
+            st.dataframe(exceptions[show], use_container_width=True, hide_index=True)
 
     with tab_agent:
-        st.markdown("### 🤖 Bounded Financial Reconciliation Agent Workflow")
-        st.caption("Lifecycle: **Observe & Normalize** ➔ **Multi-Tier Matching** ➔ **Exception Investigation** ➔ **Policy Rules** ➔ **Action Execution** ➔ **Verification & Audit**")
+        if agent_summary:
+            a1, a2, a3, a4, a5 = st.columns(5)
+            a1.metric("Cases", agent_summary.total_cases)
+            a2.metric("Resolved", agent_summary.resolved_count)
+            a3.metric("Fee Adjustments", agent_summary.fee_adjusted_count)
+            a4.metric("Pending Approval", agent_summary.pending_approval_count)
+            a5.metric("Verification", f"{agent_summary.verification_pass_rate*100:.1f}%")
+            st.markdown(agent_summary.summary_markdown)
+            case_df = pd.DataFrame(agent_summary.cases)
+            case_cols = [c for c in ["case_id", "ledger_id", "bank_id", "state", "status", "exception_type", "score"] if c in case_df.columns]
+            st.dataframe(case_df[case_cols], use_container_width=True, hide_index=True)
 
-        if "agent_summary" in st.session_state:
-            ag_sum = st.session_state["agent_summary"]
-            ac1, ac2, ac3, ac4, ac5 = st.columns(5)
-            ac1.metric("Agent Cases", f"{ag_sum.total_cases:,}")
-            ac2.metric("Resolved Cases", f"{ag_sum.resolved_count:,}", help=f"Auto-resolved: {ag_sum.auto_resolved_count}, Fee adjustments: {ag_sum.fee_adjusted_count}")
-            ac3.metric("Fee Adjustments", f"{ag_sum.fee_adjusted_count:,}")
-            ac4.metric("Pending Approval", f"{ag_sum.pending_approval_count:,}")
-            ac5.metric("Verification Rate", f"{ag_sum.verification_pass_rate*100:.1f}%")
-
-            st.markdown(ag_sum.summary_markdown)
-
-            if ag_sum.cases:
-                st.markdown("#### 📋 Agent Case Registry")
-                df_cases = pd.DataFrame(ag_sum.cases)
-                show_c_cols = ["case_id", "ledger_id", "bank_id", "state", "status", "exception_type", "score"]
-                exist_c_cols = [c for c in show_c_cols if c in df_cases.columns]
-                st.dataframe(df_cases[exist_c_cols], use_container_width=True, hide_index=True)
-
-            if st.button("🔄 Re-evaluate Agent Policies", type="secondary"):
-                with st.spinner("Re-evaluating agent policies..."):
-                    agent_inst = ReconciliationAgent()
-                    summary_inst = agent_inst.observe_and_reconcile(df_ledger, df_bank)
-                    st.session_state["agent_summary"] = summary_inst
-                    st.rerun()
+            st.markdown("#### Append-only Audit Registry")
+            if audit_df.empty:
+                st.info("No audit events generated.")
+            else:
+                audit_cols = [c for c in ["timestamp", "case_id", "ledger_id", "bank_id", "actor", "event_type", "from_state", "to_state"] if c in audit_df.columns]
+                st.dataframe(audit_df[audit_cols], use_container_width=True, hide_index=True)
+                st.download_button(
+                    "📥 Download Audit Trail (CSV)",
+                    audit_df.to_csv(index=False).encode("utf-8"),
+                    file_name="ledgerlens_audit.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
         else:
-            st.info("Run reconciliation to view the case intelligence and audit trail.")
+            st.info("Run reconciliation to generate agent cases and audit events.")
 
+    common_cols = [c for c in ["ledger_id", "bank_id", "status", "matching_rule", "score", "reason", "decision_source", "model_used", "evidence_breakdown"] if c in results.columns]
     with tab_matched:
-        df_m = results[results["status"] == "MATCHED"]
-        st.markdown(f"**{len(df_m)} Confirmed Matches**")
-        st.dataframe(df_m[cols_exist], use_container_width=True, hide_index=True)
-
+        st.dataframe(results[results["status"] == "MATCHED"][common_cols], use_container_width=True, hide_index=True)
     with tab_review:
-        df_r = results[results["status"] == "REVIEW"]
-        st.markdown(f"**{len(df_r)} Ambiguous Transactions Requiring Review**")
-        st.dataframe(df_r[cols_exist], use_container_width=True, hide_index=True)
-
+        st.dataframe(results[results["status"] == "REVIEW"][common_cols], use_container_width=True, hide_index=True)
     with tab_unmatched:
-        df_u = results[results["status"] == "UNMATCHED"]
-        st.markdown(f"**{len(df_u)} Unmatched Records**")
-        st.dataframe(df_u[cols_exist], use_container_width=True, hide_index=True)
+        st.dataframe(results[results["status"] == "UNMATCHED"][common_cols], use_container_width=True, hide_index=True)
 
-    csv_data = results.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="📥 Download Reconciliation Results (CSV)",
-        data=csv_data,
+        "📥 Download Reconciliation Results (CSV)",
+        results.to_csv(index=False).encode("utf-8"),
         file_name="reconciliation_results.csv",
         mime="text/csv",
         use_container_width=True,
     )
-
-

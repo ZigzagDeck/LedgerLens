@@ -17,13 +17,11 @@ def evaluate_reconciliation(
     config: Optional[ReconciliationConfig] = None,
     precomputed_results: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
-    """Evaluate reconciliation results against answer_key.csv with denominator-explicit metrics.
+    """Evaluate final engine decisions against answer_key.csv.
 
-    Args:
-        data_dir: Directory containing ledger.csv, bank_statement.csv, answer_key.csv.
-        config: ReconciliationConfig to use. If None, uses default CONFIG.
-        precomputed_results: If provided, skip reconciliation and evaluate these results directly.
-            This ensures evaluation uses the exact same dataset/config as the reconciliation run.
+    MATCHED is the positive prediction. REVIEW and UNMATCHED are both non-match
+    predictions for pair-level precision/recall, so a true match sent to REVIEW is
+    correctly counted as a false negative instead of disappearing from the matrix.
     """
     ledger_path = os.path.join(data_dir, "ledger.csv")
     bank_path = os.path.join(data_dir, "bank_statement.csv")
@@ -33,35 +31,32 @@ def evaluate_reconciliation(
         raise FileNotFoundError(f"Answer key missing in '{data_dir}/'. Cannot evaluate without ground truth.")
 
     df_answer = pd.read_csv(answer_path)
-
     if precomputed_results is not None:
-        df_results = precomputed_results
+        df_results = precomputed_results.copy()
     else:
         if not (os.path.exists(ledger_path) and os.path.exists(bank_path)):
             raise FileNotFoundError(f"Dataset CSVs missing in '{data_dir}/'. Run scripts/generate_dataset.py first.")
-
         df_ledger = pd.read_csv(ledger_path)
         df_bank = pd.read_csv(bank_path)
-        use_config = config if config is not None else CONFIG
-        df_results = reconcile(df_ledger, df_bank, config=use_config)
+        df_results = reconcile(df_ledger, df_bank, config=config or CONFIG)
 
-    # Merge results on ledger_id / order_id
+    ledger_results = df_results[df_results["ledger_id"].astype(str) != ""].copy()
     merged = pd.merge(
         df_answer,
-        df_results[df_results["ledger_id"] != ""],
+        ledger_results,
         left_on="order_id",
         right_on="ledger_id",
         how="outer",
     )
 
-    tp, fp, fn, tn = 0, 0, 0, 0
-    auto_tp, auto_fp = 0, 0  # Auto-resolution (deterministic MATCHED)
-    ai_tp, ai_fp = 0, 0  # AI-assisted matches
-    review_correct, review_total = 0, 0
+    tp = fp = fn = tn = 0
+    auto_tp = auto_fp = 0
+    ai_tp = ai_fp = 0
+    review_correct = review_total = 0
     invalid_ai_selection_count = 0
     ai_assisted_examples: List[Dict[str, Any]] = []
 
-    for idx, row in merged.iterrows():
+    for _, row in merged.iterrows():
         exp_status = str(row.get("expected_status", "UNMATCHED")).strip().upper()
         act_status = str(row.get("status", "UNMATCHED")).strip().upper()
         decision_src = str(row.get("decision_source", "deterministic")).strip().lower()
@@ -69,10 +64,12 @@ def evaluate_reconciliation(
         exp_utr = str(row.get("utr_reference", "")).strip() if pd.notna(row.get("utr_reference")) else ""
         act_utr = str(row.get("bank_id", "")).strip() if pd.notna(row.get("bank_id")) else ""
 
-        is_match_correct = (exp_utr == act_utr) if (exp_utr and act_utr) else (not exp_utr and not act_utr)
+        expected_match = exp_status == "MATCHED"
+        predicted_match = act_status == "MATCHED"
+        correct_pair = bool(exp_utr and act_utr and exp_utr == act_utr)
 
-        if act_status == "MATCHED":
-            if exp_status == "MATCHED" and is_match_correct:
+        if predicted_match:
+            if expected_match and correct_pair:
                 tp += 1
                 if decision_src == "groq":
                     ai_tp += 1
@@ -84,20 +81,19 @@ def evaluate_reconciliation(
                     ai_fp += 1
                 else:
                     auto_fp += 1
-        elif act_status == "REVIEW":
-            review_total += 1
-            # Review is correct if expected status is not MATCHED (i.e., it should have been escalated)
-            if exp_status != "MATCHED":
-                review_correct += 1
         else:
-            if exp_status == "MATCHED":
+            if expected_match:
                 fn += 1
             else:
                 tn += 1
 
-        # Check for invalid AI selection (AI picked a bank ID that was not correct)
+        if act_status == "REVIEW":
+            review_total += 1
+            if not expected_match:
+                review_correct += 1
+
         if decision_src == "groq":
-            if act_status == "MATCHED" and not is_match_correct:
+            if predicted_match and not (expected_match and correct_pair):
                 invalid_ai_selection_count += 1
             ai_assisted_examples.append({
                 "order_id": row.get("order_id", ""),
@@ -109,51 +105,42 @@ def evaluate_reconciliation(
                 "orig_score": row.get("original_score", 0.0),
             })
 
-    total_ledger = len(pd.read_csv(ledger_path)) if precomputed_results is not None and os.path.exists(ledger_path) else len(df_results[df_results["ledger_id"] != ""].drop_duplicates("ledger_id")) if precomputed_results is not None else len(pd.read_csv(ledger_path))
+    if os.path.exists(ledger_path):
+        total_ledger = len(pd.read_csv(ledger_path))
+    else:
+        total_ledger = ledger_results["ledger_id"].nunique()
     total_bank = len(pd.read_csv(bank_path)) if os.path.exists(bank_path) else 0
     total_results = len(df_results)
 
     ai_calls_count = len(df_results[df_results["decision_source"] == "groq"])
     ai_matched_count = len(df_results[(df_results["decision_source"] == "groq") & (df_results["status"] == "MATCHED")])
-    deterministic_count = total_results - ai_calls_count
     deterministic_matched = len(df_results[(df_results["decision_source"] == "deterministic") & (df_results["status"] == "MATCHED")])
 
     matches_count = len(df_results[df_results["status"] == "MATCHED"])
     reviews_count = len(df_results[df_results["status"] == "REVIEW"])
     unmatched_ledger_count = len(df_results[(df_results["ledger_id"] != "") & (df_results["status"] == "UNMATCHED")])
     unmatched_bank_count = len(df_results[(df_results["ledger_id"] == "") & (df_results["status"] == "UNMATCHED")])
-
     duplicate_assignments = len(df_results[df_results["matching_rule"] == "ONE_TO_ONE_CONFLICT"])
 
-    # Core pairing metrics
-    pair_precision = round(tp / (tp + fp), 4) if (tp + fp) > 0 else 0.0
-    pair_recall = round(tp / (tp + fn), 4) if (tp + fn) > 0 else 0.0
-    f1_score = round(2 * pair_precision * pair_recall / (pair_precision + pair_recall), 4) if (pair_precision + pair_recall) > 0 else 0.0
+    pair_precision = round(tp / (tp + fp), 4) if (tp + fp) else 0.0
+    pair_recall = round(tp / (tp + fn), 4) if (tp + fn) else 0.0
+    f1_score = round(2 * pair_precision * pair_recall / (pair_precision + pair_recall), 4) if (pair_precision + pair_recall) else 0.0
 
-    # Auto-resolution metrics (deterministic only)
-    auto_precision = round(auto_tp / (auto_tp + auto_fp), 4) if (auto_tp + auto_fp) > 0 else 0.0
-    auto_recall = round(auto_tp / (tp + fn), 4) if (tp + fn) > 0 else 0.0
+    auto_precision = round(auto_tp / (auto_tp + auto_fp), 4) if (auto_tp + auto_fp) else 0.0
+    auto_recall = round(auto_tp / (tp + fn), 4) if (tp + fn) else 0.0
+    ai_precision = round(ai_tp / (ai_tp + ai_fp), 4) if (ai_tp + ai_fp) else 0.0
+    review_precision = round(review_correct / review_total, 4) if review_total else 0.0
+    exception_recall = round(tn / (tn + fp), 4) if (tn + fp) else 0.0
+    fpr = round(fp / (fp + tn), 4) if (fp + tn) else 0.0
+    fnr = round(fn / (fn + tp), 4) if (fn + tp) else 0.0
 
-    # Review precision: fraction of REVIEW decisions that were correctly non-MATCHED
-    review_precision = round(review_correct / review_total, 4) if review_total > 0 else 0.0
+    automated_coverage = round(matches_count / total_ledger, 4) if total_ledger else 0.0
+    review_rate = round(reviews_count / total_ledger, 4) if total_ledger else 0.0
+    unmatched_rate = round(unmatched_ledger_count / total_ledger, 4) if total_ledger else 0.0
+    deterministic_match_rate = round(deterministic_matched / total_ledger, 4) if total_ledger else 0.0
+    ai_escalation_rate = round(ai_calls_count / total_ledger, 4) if total_ledger else 0.0
+    ai_match_rate = round(ai_matched_count / ai_calls_count, 4) if ai_calls_count else 0.0
 
-    # Exception recall: fraction of truly non-matchable records caught
-    expected_non_match = tn + fn  # Records that should NOT be MATCHED
-    exception_recall = round((tn + review_correct) / expected_non_match, 4) if expected_non_match > 0 else 0.0
-
-    fpr = round(fp / (fp + tn), 4) if (fp + tn) > 0 else 0.0
-    fnr = round(fn / (fn + tp), 4) if (fn + tp) > 0 else 0.0
-
-    # Coverage and rates
-    total_expected_matches = tp + fn
-    automated_coverage = round(matches_count / total_ledger, 4) if total_ledger > 0 else 0.0
-    review_rate = round(reviews_count / total_ledger, 4) if total_ledger > 0 else 0.0
-    unmatched_rate = round(unmatched_ledger_count / total_ledger, 4) if total_ledger > 0 else 0.0
-    deterministic_match_rate = round(deterministic_matched / total_ledger, 4) if total_ledger > 0 else 0.0
-    ai_escalation_rate = round(ai_calls_count / total_ledger, 4) if total_ledger > 0 else 0.0
-    ai_match_rate = round(ai_matched_count / ai_calls_count, 4) if ai_calls_count > 0 else 0.0
-
-    # Headline metric: precision at automated coverage
     precision_at_coverage = f"{pair_precision*100:.1f}% precision at {automated_coverage*100:.1f}% automated coverage"
 
     metrics = {
@@ -162,12 +149,12 @@ def evaluate_reconciliation(
             "total_bank_records": total_bank,
             "total_results_rows": total_results,
         },
-        # Canonical metric keys
         "pair_precision": pair_precision,
         "pair_recall": pair_recall,
         "f1_score": f1_score,
         "auto_resolution_precision": auto_precision,
         "auto_resolution_recall": auto_recall,
+        "ai_match_precision": ai_precision,
         "review_precision": review_precision,
         "exception_recall": exception_recall,
         "false_positive_rate": fpr,
@@ -203,8 +190,8 @@ def evaluate_reconciliation(
     print("-" * 65)
     print(f">>> {precision_at_coverage} <<<")
     print("-" * 65)
-    print(f"Pair Precision           : {pair_precision:.4f}  (TP / (TP + FP))")
-    print(f"Pair Recall              : {pair_recall:.4f}  (TP / (TP + FN))")
+    print(f"Pair Precision           : {pair_precision:.4f}")
+    print(f"Pair Recall              : {pair_recall:.4f}")
     print(f"F1 Score                 : {f1_score:.4f}")
     print(f"Auto-Resolution Precision: {auto_precision:.4f}")
     print(f"Auto-Resolution Recall   : {auto_recall:.4f}")
@@ -212,20 +199,8 @@ def evaluate_reconciliation(
     print(f"Exception Recall         : {exception_recall:.4f}")
     print(f"False Positive Rate      : {fpr:.4f}")
     print(f"False Negative Rate      : {fnr:.4f}")
-    print("-" * 65)
-    print(f"Matches (MATCHED)    : {matches_count} ({automated_coverage*100:.1f}%)")
-    print(f"Reviews (REVIEW)     : {reviews_count} ({review_rate*100:.1f}%)")
-    print(f"Unmatched Ledger     : {unmatched_ledger_count}")
-    print(f"Unmatched Bank       : {unmatched_bank_count}")
-    print("-" * 65)
-    print(f"Deterministic Match Rate : {deterministic_match_rate:.2%}")
-    print(f"AI Escalation Rate       : {ai_escalation_rate:.2%}")
-    print(f"AI Match Success Rate    : {ai_match_rate:.2%}")
-    print(f"One-to-One Conflicts     : {duplicate_assignments}")
-    print(f"Invalid AI Selections    : {invalid_ai_selection_count}")
     print("=" * 65)
 
-    # Save to Excel
     results_excel_path = os.path.join(data_dir, "reconciliation_results.xlsx")
     try:
         with pd.ExcelWriter(results_excel_path, engine="openpyxl") as writer:

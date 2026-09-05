@@ -1,95 +1,118 @@
-# Phase 4 Final Engineering Audit & Gate Verification
+# LedgerLens Final Engineering Audit
 
-A comprehensive audit verifying repository cleanliness, answer-key isolation, leakage rates, static code cleanliness, and benchmark integrity for LedgerLens.
+## Verification status
 
----
+The current implementation is verified in GitHub Actions on Python 3.11 with:
 
-## 1. Answer-Key Isolation Final Gate
+- source compilation via `python -m compileall -q src app api scripts tests`
+- **73 passing pytest tests**
+- offline benchmark execution
+- answer-key isolation audit
 
-### Verification Methodology
-Scanning all source code modules in `src/` to prove that matching core modules NEVER read, load, or reference `answer_key.csv`.
-
-### Module Isolation Verification Table
-
-| File | Status | Notes |
-| :--- | :--- | :--- |
-| `src/reconciliation.py` | **PASSED** (0 references) | Pure matching core. Zero answer key imports or references. |
-| `src/ai_matcher.py` | **PASSED** (0 references) | Bounded AI assistant. Zero answer key imports or references. |
-| `src/normalization.py` | **PASSED** (0 references) | Normalization utilities. Zero answer key imports or references. |
-| `src/schemas.py` | **PASSED** (0 references) | Data structures & Pydantic schemas. Zero answer key imports or references. |
-| `src/config.py` | **PASSED** (0 references to `answer_key.csv`) | Contains `ANSWER_KEY_COLUMNS` schema string constants for dataset export. |
-| `src/data_validation.py` | **PASSED** | Data auditor & schema validator. Uses dynamic string concatenation `("answer" + "_key.csv")` inside audit function. |
-| `src/evaluation.py` | **ALLOWED** | Benchmark evaluation module. Permitted to load `answer_key.csv` for ground-truth comparison. |
-| `app/api.py` | **PASSED** (0 references) | REST API endpoints. Zero answer key imports or references. |
-| `app/app.py` | **PASSED** (0 references) | Streamlit Web UI. Zero answer key imports or references. |
+The CI benchmark intentionally runs without a Groq key so external model output cannot make the build nondeterministic. Ambiguous AI-gated records therefore degrade safely to `REVIEW`.
 
 ---
 
-## 2. Deterministic ID Leakage Final Gate
+## Corrected benchmark accounting
 
-### Reference Leakage Analysis (`scripts/audit_repo.py`)
+The evaluator treats only `MATCHED` as a positive pair prediction. `REVIEW` and `UNMATCHED` are non-match predictions for pair metrics.
 
-- **Total Bank Records Audited**: 250 records
-- **Exact Reference Rate**: `68.00%` (170 / 250 records contain exact `ORD-XXXX` string)
-- **Partial Reference Rate**: `8.00%` (20 / 250 records contain mutated/OCR references like `ORD / 1024` or `ORD01024`)
-- **No Reference Rate**: `24.00%` (60 / 250 records contain NO order ID reference in narration)
+This means a true pair routed to human review is a **false negative for automated pair recall**. Earlier audit numbers that omitted REVIEW rows from TP/FP/FN/TN were optimistic and are superseded by the corrected results below.
 
----
+### Checked-in canonical dataset
 
-## 3. Overly Easy Data Final Gate
+- Ledger rows: **225**
+- Bank rows: **250**
+- Result rows: **259**
 
-### Scenario & Difficulty Distribution
+### Reproducible no-key CI baseline
 
-- **Total Ledger Records**: 225
-- **Total Bank Records**: 250
-- **Total Answer Key Entries**: 235
+| Metric | Result |
+|---|---:|
+| Pair Precision | 88.24% |
+| Pair Recall | 75.00% |
+| F1 | 81.08% |
+| Auto-Resolution Precision | 88.24% |
+| Auto-Resolution Recall | 75.00% |
+| Automated MATCHED Coverage | 60.44% |
+| Review Rate | 36.00% |
+| AI-Gate / Escalation Rate | 36.00% |
+| False Positive Rate | 21.33% |
+| False Negative Rate | 25.00% |
 
-| Scenario Class | Count | Percentage | Difficulty Description |
-| :--- | :--- | :--- | :--- |
-| `EASY_EXACT` | 70 | 29.8% | Exact match baseline |
-| `NOISY_REFERENCE` | 40 | 17.0% | OCR errors, slashes, spaces in narration |
-| `FEE_DIFFERENCE` | 20 | 8.5% | Payment gateway MDR fee deductions |
-| `DATE_SHIFT` | 20 | 8.5% | 1–3 day settlement delays |
-| `DUPLICATE_NEAR_DUPLICATE` | 20 | 8.5% | Legitimate repeated transactions |
-| `AMBIGUOUS` | 15 | 6.4% | Identical amount/date decoys |
-| `FALSE_POSITIVE_TRAP` | 10 | 4.3% | High-similarity decoy bank records |
-| `AMOUNT_NEAR_MATCH` | 10 | 4.3% | Minor near-matches (5000 vs 4999) |
-| `UNMATCHED_LEDGER` | 10 | 4.3% | Ledger records with no bank credit |
-| `UNMATCHED_BANK` | 10 | 4.3% | Bank deposits with no ledger record |
-| `REVERSAL_ADJUSTMENT` | 6 | 2.5% | Chargeback adjustments |
-| `FEE_ONLY_SETTLEMENT` | 4 | 1.7% | Explicit settlement fee entries |
+Confusion matrix:
 
-### Amount & Date Matchability Audit (17-Point Audit Metric 17)
+- TP: 120
+- FP: 16
+- FN: 40
+- TN: 59
 
-- **Unique Amount + Date Matchable**: `49.33%` (111 / 225 ledger records uniquely match 1 bank record on amount + date)
-- **Multiple Amount + Date Candidates**: `22.22%` (50 / 225 ledger records match multiple bank candidate records on amount + date)
-- **No Amount + Date Candidate**: `28.44%` (64 / 225 ledger records have no matching bank candidate on exact amount + date)
+Headline: **88.2% precision at 60.4% automated coverage**.
+
+Live Groq runs are expected to differ and must be measured in the environment where they are executed rather than copied from a previous model/API run.
 
 ---
 
-## 4. Static Code Cleanliness & AI Safety Audit
+## Dataset difficulty checks
 
-### Findings Matrix
+Current canonical dataset audit:
 
-1. **`TODO` / `FIXME` Comments**: 0 found across `src/`, `app/`, `api/`, `scripts/`.
-2. **`print()` Statements**:
-   - Runtime core (`reconciliation.py`, `ai_matcher.py`, `normalization.py`, `schemas.py`): **0** print statements.
-   - CLI scripts & evaluation modules (`evaluation.py`, `data_validation.py`, `data_generator.py`, `audit_repo.py`, `run_benchmark.py`): Print statements restricted strictly to `if __name__ == "__main__":` or CLI report output.
-3. **Hard-Coded API Keys / Secrets**: **0** found. `GROQ_API_KEY` is loaded strictly via `os.getenv("GROQ_API_KEY")`.
-4. **Secrets in Git**: `.env` is listed in `.gitignore`. `.env.example` contains mock placeholders.
-5. **Bare `except:` blocks**: **0** bare excepts found. All exception handlers use typed `except Exception as e:` with safe fallback routines.
-6. **Strict AI Safety Veto**: Missing `selected_bank_id` when `same_transaction=true` strictly vetoes match to `REVIEW`. Hallucinated bank IDs vetoed.
-7. **Truthful API Observability**: Debug traces report explicit safety check outcomes (`hard_safety_checks`, `candidate_id_check`, `amount_safety_check`, `currency_safety_check`, `one_to_one_check`).
+- exact reference rate: **68%**
+- partial/noisy reference rate: **8%**
+- no-reference rate: **24%**
+- unique amount+date matchable: **49.33%**
+- multiple amount+date candidates: **22.22%**
+- no exact amount+date candidate: **28.44%**
+
+The benchmark contains duplicate, ambiguous, fee, date-shift, false-positive-trap, unmatched, reversal, and fee-only scenarios.
 
 ---
 
-## 5. Benchmark Integrity Verification
+## Safety and integrity gates
 
-- **Precision**: `0.9639`
-- **Recall**: `1.0000`
-- **F1 Score**: `0.9816`
-- **False Positive Rate**: `0.0800`
-- **False Negative Rate**: `0.0000`
+### Ground-truth isolation
 
-> [!IMPORTANT]
-> Benchmark precision is non-perfect (96.39%) and exposes genuine reconciliation difficulty (e.g. false positive trap decoys and fee deduction ambiguity) without artificial ground-truth manipulation.
+Matching code does not load `answer_key.csv`. The answer key is restricted to evaluation/audit paths.
+
+### AI boundaries
+
+- Only deterministically generated candidate IDs can be selected.
+- A hallucinated candidate ID is vetoed to `REVIEW`.
+- Missing/malformed responses safely degrade to `REVIEW`.
+- Untrusted ledger and bank text is sanitized before it enters the LLM prompt.
+- AI cache identity fingerprints transaction/candidate content and relevant configuration, preventing stale decisions when IDs are reused with changed data.
+- Rate limiting uses a 60-second sliding window.
+- HTTP 429 retries use 2s, 4s, and 8s exponential backoff.
+
+### Financial invariants
+
+- Cross-currency contradictions are routed to `REVIEW`.
+- One bank match cannot safely resolve multiple ledger records.
+- Selected AI candidate evidence is preserved for the actual selected candidate rather than the top-ranked candidate.
+- Fee auto-adjustment policy is bounded at ₹100 by default.
+
+### Agent/audit invariants
+
+Cases traverse audited lifecycle states beginning at `NEW`, then `INGESTING`, `NORMALIZING`, and `RECONCILING` before the matching outcome state.
+
+Action execution and final verification transitions are logged through the same append-only audit mechanism. Repeated actions are protected by `case_id:action_type` idempotency keys and produce an idempotency audit event.
+
+---
+
+## API/UI consistency gates
+
+- Streamlit reconciliation, agent processing, and benchmark evaluation reuse the same configuration and result DataFrame.
+- A session-entered Groq key is stored in Streamlit session state rather than copied into global process environment state.
+- Custom-data API requests never silently fall back to benchmark data when the custom pair is incomplete.
+- Debug traces expose evidence breakdown and candidate/safety metadata.
+- Upload validation checks all fields directly required by the runtime engine.
+- `python-multipart` is installed for FastAPI file uploads.
+
+---
+
+## Remaining intentional limitations
+
+- Live Razorpay settlement fetching is not implemented; the checked-in demo/canonical adapter is supported and tested.
+- Batch aggregate detection is heuristic, not exhaustive arbitrary subset-sum optimization.
+- Live FX conversion is not implemented; cross-currency records are routed to review.
+- Live LLM performance is external and nondeterministic; CI uses the deterministic no-key baseline.

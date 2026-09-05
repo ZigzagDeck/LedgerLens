@@ -1,364 +1,404 @@
 # LedgerLens: AI-Powered Financial Reconciliation Engine
 
-LedgerLens is an enterprise-grade financial reconciliation engine combining multi-tier deterministic matching with guardrailed Groq AI assistance. It reconciles internal sales/order ledgers against bank statements and payment gateway settlements with mathematical rigor, bounded LLM invocation, policy-driven automation, and an immutable audit trail.
+LedgerLens reconciles internal sales/order ledgers against bank statements using a **deterministic-first, bounded-AI** architecture. Exact and high-confidence cases are handled locally; genuinely ambiguous cases may be escalated to Groq with a restricted candidate set, prompt-injection sanitization, deterministic vetoes, rate limiting, safe fallback, policy checks, action verification, and an append-only audit trail.
+
+The repository includes a Streamlit dashboard, FastAPI API, synthetic benchmark generator, finance-controller layer, Razorpay demo adapter, agent workflow, observability traces, and automated tests.
 
 ---
 
-## 📌 Table of Contents
-- [File Architecture](#-file-architecture)
-- [The Problem](#-the-problem)
-- [The Solution: Multi-Tier Bounded Architecture](#-the-solution-multi-tier-bounded-architecture)
-- [Bounded Agent Workflow Loop](#-bounded-agent-workflow-loop)
-- [Core Agent Components](#-core-agent-components)
-- [The Role of AI & Rate Limit Governance](#-the-role-of-ai--rate-limit-governance)
-- [Interactive Streamlit Web Dashboard](#-interactive-streamlit-web-dashboard)
-- [Benchmark Ground-Truth Evaluation](#-benchmark-ground-truth-evaluation)
-- [REST API & Observability](#-rest-api--observability)
-- [Installation & Quickstart](#-installation--quickstart)
-- [Streamlit Cloud Deployment](#-streamlit-cloud-deployment)
-- [Developer CLI Commands](#-developer-cli-commands)
-- [Known Limitations](#-known-limitations)
+## The problem
+
+Financial reconciliation is difficult because the same transaction often looks different across internal systems and bank statements:
+
+- **Gateway/MDR deductions:** an internal ₹5,000 order may arrive as a ₹4,950 bank credit.
+- **Settlement delays:** a Monday order may settle several days later.
+- **Narration noise:** bank text may add prefixes, codes, separators, or truncated references.
+- **Duplicate amounts:** several legitimate orders can share the same amount and date.
+- **Missing records:** a ledger transaction or bank credit may have no counterpart.
+- **Safety requirements:** a reconciliation engine must never silently double-assign one bank credit or trust an LLM-generated identifier outside the candidate set.
 
 ---
 
-## 🗂️ File Architecture
+## Architecture
 
-```
-Reconcilliation project/
-│
-├── .env                          # Environment variables (GROQ_API_KEY lives here)
-├── .env.example                  # Template showing all required env vars
-├── .gitignore                    # Git ignore rules
-├── .python-version               # Pinned Python version (pyenv)
-├── requirements.txt              # All Python dependencies
-│
-├── app/                          # ◀ USER-FACING INTERFACES
-│   ├── app.py                    # Streamlit web dashboard (main UI entry point)
-│   └── api.py                    # FastAPI REST endpoints (JSON API server)
-│
-├── api/
-│   └── server.py                 # FastAPI app bootstrap / ASGI entry point
-│
-├── src/                          # ◀ CORE ENGINE
-│   ├── config.py                 # Central config: thresholds, limits, env loading
-│   ├── schemas.py                # Pydantic data models (LedgerEntry, BankEntry, etc.)
-│   ├── normalization.py          # Input cleaning: float parsing, ISO dates, text strip
-│   ├── reconciliation.py         # 🔑 Main engine: Tier 1/2/3 matching + scoring logic
-│   ├── ai_matcher.py             # Groq LLM caller: prompt builder, rate limiter, vetoes
-│   ├── data_generator.py         # Synthetic data factory (12 scenario classes)
-│   ├── data_validation.py        # Schema validation & integrity checks on uploaded CSVs
-│   ├── evaluation.py             # Benchmark evaluator: precision, recall, F1 vs answer key
-│   │
-│   ├── agent/                    # ◀ STATEFUL AGENT WORKFLOW
-│   │   ├── __init__.py           # Package init + public exports
-│   │   ├── models.py             # Agent-specific Pydantic models (WorkflowState, etc.)
-│   │   ├── orchestrator.py       # 🔑 Agent loop: coordinates investigator + policy + actions
-│   │   ├── investigator.py       # Evidence gathering: enriches ambiguous match candidates
-│   │   ├── policy.py             # Rule engine: decides AUTO_APPROVE / ESCALATE / REVIEW
-│   │   └── actions.py            # Action executor: applies decisions, writes audit events
-│   │
-│   ├── connectors/               # ◀ EXTERNAL DATA CONNECTORS
-│   │   ├── __init__.py           # Package init
-│   │   └── razorpay.py           # Razorpay Gateway connector (simulated settlement fetch)
-│   │
-│   └── services/                 # ◀ BUSINESS SERVICES
-│       ├── __init__.py           # Package init
-│       └── finance_controller.py # Finance service: orchestrates end-to-end recon flow
-│
-├── scripts/                      # ◀ DEVELOPER UTILITIES (run directly via `python`)
-│   ├── generate_dataset.py       # Generate synthetic ledger + bank CSV test datasets
-│   ├── run_benchmark.py          # Run offline benchmark vs answer_key.csv, print metrics
-│   ├── run_throughput.py         # Throughput stress test (rows/sec measurement)
-│   ├── audit_dataset.py          # Inspect & summarize a generated dataset
-│   └── audit_repo.py             # Audit project file sizes and structure
-│
-├── tests/                        # ◀ AUTOMATED TEST SUITE (pytest)
-│   ├── test_reconciliation.py    # Unit + integration tests for the core matching engine
-│   ├── test_agent_workflow.py    # Agent orchestrator workflow tests
-│   ├── test_api.py               # FastAPI endpoint integration tests
-│   ├── test_finance_controller.py# Finance service layer tests
-│   └── test_razorpay.py          # Razorpay connector mock tests
-│
-├── data/                         # ◀ DATASETS & OUTPUTS
-│   ├── ledger.csv                # Sample internal sales ledger
-│   ├── bank_statement.csv        # Sample bank statement
-│   ├── answer_key.csv            # Ground-truth match pairs (for benchmark)
-│   ├── reconciliation_dataset.xlsx  # Combined dataset workbook
-│   ├── reconciliation_results.xlsx  # Last reconciliation output workbook
-│   ├── .ledgerlens_cache.json    # LLM response cache (avoids repeat API calls)
-│   ├── demo/                     # Demo-specific CSVs
-│   └── custom/                   # User-uploaded custom datasets
-│
-└── docs/                         # ◀ PROJECT DOCUMENTATION
-    ├── ARCHITECTURE.md           # High-level system architecture overview
-    ├── CODE_MAP.md               # Detailed code map (function-level descriptions)
-    ├── DATA_CONTRACT.md          # CSV schema contracts & field definitions
-    ├── EVALUATION.md             # Evaluation methodology & metrics explanation
-    ├── JUDGE_GUIDE.md            # Hackathon judge quick-start guide
-    ├── THROUGHPUT.md             # Throughput benchmark results
-    └── PHASE*_CHANGELOG.md       # Per-phase development changelogs
+```text
+Ledger + Bank Statement
+        |
+        v
+Schema Validation
+        |
+        v
+Normalization
+(amount/date/text/reference)
+        |
+        v
+Tier 1: Exact Reference + Safety Checks
+        |
+        v
+Tier 2: Unique Exact Amount + Date
+        |
+        v
+Tier 3: Multi-Evidence Scoring
+(ref 40%, amount 30%, date 20%, text 10%)
+        |
+        +--> score >= 0.82 ------------------> MATCHED
+        |
+        +--> score < 0.45 -------------------> UNMATCHED
+        |
+        +--> ambiguous / 0.45..0.82
+                    |
+                    v
+           Bounded Groq Assistant
+           - top 3 candidates only
+           - untrusted text sanitized
+           - candidate-ID veto
+           - response schema validation
+           - rate limiting + retry
+           - safe REVIEW fallback
+                    |
+                    v
+           Policy + Action + Verification
+                    |
+                    v
+              Append-only Audit
 ```
 
-### Key Entry Points at a Glance
-
-| What you want to do | File to open |
-|---|---|
-| Launch the web UI | `app/app.py` (run: `streamlit run app/app.py`) |
-| Start the REST API | `api/server.py` (run: `uvicorn api.server:app`) |
-| Understand matching logic | `src/reconciliation.py` |
-| Understand AI escalation | `src/ai_matcher.py` |
-| Understand agent decisions | `src/agent/orchestrator.py` + `policy.py` |
-| Generate test data | `scripts/generate_dataset.py` |
-| Run the benchmark | `scripts/run_benchmark.py` |
-| Run all tests | `pytest tests/` |
+The percentages of records handled by each tier depend on the dataset and thresholds. The checked-in canonical dataset currently produces **60.4% automated MATCHED coverage** in the no-key CI baseline, while **36.0% of ledger records reach the AI gate and safely become REVIEW when no Groq key is configured**.
 
 ---
 
-## ⚠️ The Problem
+## Matching rules
 
-Financial reconciliation is a mandatory accounting process where internal transaction ledgers must be verified against external bank credits. Manual reconciliation is slow, expensive, and error-prone due to:
-- **Gateway Fee Deductions (MDR)**: A ₹5,000 internal order credited as ₹4,950 due to a ₹50 deduction.
-- **Settlement Date Delays**: Orders placed on Monday may appear in bank statements 1 to 3 business days later.
-- **Narration Noise & Truncation**: Banking rails append prefixes, bank codes, or truncate references (e.g. `CMS/N1024/SETTL` instead of `ORD-1024`).
-- **Duplicate & Near-Duplicate Ambiguity**: Multiple identical-amount orders on the same date requiring one-to-one conflict resolution.
+### Tier 1 — exact reference
 
----
+A bank row is matched immediately only when the reference is present and deterministic safety conditions are satisfied. Currency contradictions are never matched; they are routed to `REVIEW` with `CURRENCY_MISMATCH`.
 
-## 💡 The Solution: Multi-Tier Bounded Architecture
+### Tier 2 — unique amount + date
 
-LedgerLens operates on a **deterministic-first, bounded-AI** principle:
+A unique amount/date/currency candidate can be matched when there is no contradictory extracted order reference.
 
-```
-                  ┌─────────────────────────────────────┐
-                  │   Internal Ledger & Bank Statement  │
-                  └──────────────────┬──────────────────┘
-                                     │
-                         1. Schema Normalization
-                         (Floats, ISO dates, text)
-                                     │
-                                     ▼
-                   ┌───────────────────────────────────┐
-                   │ Tier 1: Exact Reference Matching  │──▶ MATCHED (~60%)
-                   └─────────────────┬─────────────────┘
-                                     │ Unmatched
-                                     ▼
-                   ┌───────────────────────────────────┐
-                   │ Tier 2: Unique Amount + Date Match│──▶ MATCHED (~10%)
-                   └─────────────────┬─────────────────┘
-                                     │ Unmatched
-                                     ▼
-                   ┌───────────────────────────────────┐
-                   │ Tier 3: Multi-Evidence Scoring    │──▶ MATCHED (Score ≥ 0.82)
-                   │ (Ref 40%, Amt 30%, Date 20%, Name)│──▶ UNMATCHED (Score < 0.45)
-                   └─────────────────┬─────────────────┘
-                                     │
-                        Ambiguous Pool (0.45 ≤ Score < 0.82)
-                                     │
-                                     ▼
-                   ┌───────────────────────────────────┐
-                   │ Bounded Groq LLM Assistant        │──▶ MATCHED (AI validated)
-                   │ (Top 3 candidates only + Vetoes)  │──▶ REVIEW (Safe fallback)
-                   └───────────────────────────────────┘
-```
+### Tier 3 — evidence scoring
 
-1. **Deterministic Core (70–75% Coverage)**: High-confidence exact reference matches and unique amount/date pairs are reconciled instantaneously with zero API cost.
-2. **Multi-Evidence Weighted Scoring**: Balances reference similarity, date proximity, amount difference, and customer text.
-3. **Bounded AI Assistance (~15–25% Escalation)**: Only ambiguous records are sent to the Groq LLM with strictly restricted candidate pools and deterministic validation vetoes.
-4. **Stateful Policy & Action Engine**: Automatically executes low-risk actions (e.g., fee adjustments $\le ₹100$) and routes high-risk conflicts to human review.
+Candidates inside the broad amount/date window are scored using:
+
+| Evidence | Weight |
+|---|---:|
+| Reference similarity | 40% |
+| Amount consistency | 30% |
+| Date proximity | 20% |
+| Customer/narration text | 10% |
+
+- `score >= 0.82` → deterministic `MATCHED`
+- `score < 0.45` → `UNMATCHED`
+- intermediate or close competing candidates → bounded AI or `REVIEW`
+
+A bank transaction can be assigned to at most one matched ledger record. Defensive one-to-one conflict resolution downgrades conflicting claims to `REVIEW`.
 
 ---
 
-## 🔄 Bounded Agent Workflow Loop
+## Bounded AI and safety controls
 
-```mermaid
-graph TD
-    A[Data Sources: Ledger & Bank Statement] --> B[1. OBSERVE & INGEST]
-    B --> C[2. NORMALIZE & VALIDATE]
-    C --> D[3. RECONCILE: Multi-Tier Engine]
-    D --> E{Deterministic Match Status?}
-    E -- "High Confidence MATCHED" --> F[4. POLICY ENGINE Check]
-    E -- "Ambiguous / Review Exception" --> G[5. EXCEPTION INVESTIGATOR Agent]
-    E -- "UNMATCHED Record" --> F
-    G --> H[6. STRUCTURED RECOMMENDATION]
-    H --> F
-    F -- "Low-Risk Auto-Allowed" --> I[7. ACTION SERVICE Execution]
-    F -- "High-Risk / Human Required" --> J[8. ACTION_PENDING_APPROVAL Human Review]
-    I --> K[9. VERIFICATION LOOP]
-    J -- "Human Approved" --> I
-    K -- "Outcome Verified" --> L[10. APPEND-ONLY AUDIT LOG & State Update]
+LedgerLens does not send every transaction to an LLM.
+
+For the checked-in 225-ledger-row benchmark with current thresholds, **81 rows (36.0%) reach the AI gate**. With no API key those rows safely become `REVIEW`. With a Groq key, the built-in rate limiter processes them across as many rate-limit windows as required.
+
+Safety controls include:
+
+1. **Top-3 candidate boundary** — the model can choose only from candidates supplied by deterministic generation.
+2. **Candidate-ID hallucination veto** — an unknown `selected_bank_id` is rejected and routed to `REVIEW`.
+3. **Structured response validation** — Groq JSON is validated with Pydantic before use.
+4. **Prompt-injection sanitization** — ledger/customer/narration text is treated as untrusted data; URLs, control characters, jailbreak/override phrases, flooding, and oversized input are sanitized before entering the prompt.
+5. **Content-aware AI cache** — cache identity fingerprints the full sanitized ledger/candidate payload and relevant configuration, preventing stale decisions when transaction content changes under the same IDs.
+6. **Sliding-window rate limiter** — default `25` calls/minute via `GROQ_MAX_CALLS_PER_MINUTE`.
+7. **429 exponential backoff** — retries use the documented `2s`, `4s`, `8s` sequence.
+8. **Safe degradation** — missing key, network failure, invalid JSON, or validation failure defaults to `REVIEW` rather than an unsafe match.
+
+---
+
+## Stateful agent workflow
+
+The agent follows explicit audited states rather than jumping directly to a final result:
+
+```text
+NEW
+ -> INGESTING
+ -> NORMALIZING
+ -> RECONCILING
+ -> MATCHED / AMBIGUOUS / UNMATCHED
+ -> INVESTIGATING (when needed)
+ -> RECOMMENDATION_READY
+ -> POLICY_APPROVED or ACTION_PENDING_APPROVAL
+ -> ACTION_EXECUTING
+ -> ACTION_VERIFYING
+ -> RESOLVED / UNMATCHED / ACTION_PENDING_APPROVAL
 ```
 
----
+Every state change, action execution, verification result, and idempotency hit is recorded as an `AuditEvent`.
 
-## 🧩 Core Agent Components
+### Policy rules
 
-### 1. Stateful Case Machine (`src/agent/models.py`)
-Tracks transaction reconciliation through explicit states:
-`NEW` → `INGESTING` → `NORMALIZING` → `RECONCILING` → `INVESTIGATING` → `RECOMMENDATION_READY` → `POLICY_APPROVED` → `ACTION_EXECUTING` → `ACTION_VERIFYING` → `RESOLVED`.
+- High-confidence deterministic matches can be marked reconciled automatically.
+- AI-confirmed matches are accepted only after the bounded candidate checks and deterministic vetoes have passed.
+- Fee adjustments up to **₹100** can be auto-approved by policy unless approval is configured as mandatory.
+- Currency contradictions and one-to-one conflicts require human review.
+- Unsupported or unsafe actions fall back to review behavior.
 
-### 2. Exception Investigator (`src/agent/investigator.py`)
-Classifies discrepancies into domain exceptions (`FEE_ADJUSTMENT`, `DATE_MISMATCH`, `ONE_TO_ONE_CONFLICT`, `CURRENCY_MISMATCH`, `BATCH_AGGREGATE_SUSPECTED`) and generates actionable recommendations.
+### Idempotency
 
-### 3. Deterministic Policy Engine (`src/agent/policy.py`)
-Enforces financial guardrails:
-- **Fee Adjustment Tolerance**: Auto-adjustment allowed **only** if fee variance $\le ₹100.0$.
-- **Auto-Match Threshold**: Auto-approval allowed **only** if confidence score $\ge 0.82$.
-- **Prompt Injection Defense**: Defense-in-depth sanitization (`sanitize_untrusted_text`) stripping control characters, redacting URLs (`[REDACTED_URL]`), limiting character flooding, sanitizing jailbreak/override phrases (`[REDACTED_TEXT]`), and truncating untrusted text.
-- **Risk Tiers**: Assigns `LOW`, `MEDIUM`, or `HIGH` risk classifications.
-
-### 4. Action Handlers & Outcome Verification (`src/agent/actions.py`)
-Bounded actions (`MARK_RECONCILED`, `CREATE_FEE_ADJUSTMENT`, `FLAG_FOR_REVIEW`, `MARK_UNMATCHED`) run through post-execution verification checks and idempotency guards (`case_id:action_type` keys).
+Actions use a `case_id:action_type` idempotency key, preventing duplicate financial side effects during repeated execution.
 
 ---
 
-## 🤖 The Role of AI & Rate Limit Governance
+## Streamlit dashboard
 
-### Why 200+ Rows ≠ 200 API Calls
-In LedgerLens, the LLM is **never** invoked for all rows. Because deterministic matching handles ~75% of transactions and rejects clear non-matches:
-- In a canonical **225-row dataset**, only **15 to 25 records** require AI evaluation.
-- A single free-tier Groq API key (30 RPM) can process the entire 225-record benchmark without exceeding rate limits.
+Run:
 
-### Built-in Governance & Safety Guards
-1. **Sliding-Window Rate Limiter**: Controls outgoing requests via a sliding 60-second window (default 25 RPM) configured via `GROQ_MAX_CALLS_PER_MINUTE`. Calls pause automatically to avoid HTTP 429 errors.
-2. **HTTP 429 Exponential Backoff**: Automatically pauses and retries up to 3 times (`2s`, `4s`, `8s`) if rate limits are reached.
-3. **Deterministic Hallucination Veto**: The engine supplies only the top 3 candidates to the model. If the LLM selects a bank ID outside this candidate set, the decision is immediately vetoed and routed to `REVIEW`.
-4. **In-Memory Decision Cache**: Identical candidate comparisons are cached in memory, preventing duplicate API calls.
-5. **Safe Degradation**: If an API key is missing, network fails, or output JSON is malformed, transactions safely default to `REVIEW` with clear audit logs.
-
----
-
-## 🖥️ Interactive Streamlit Web Dashboard
-
-Launch the web application:
 ```bash
 streamlit run app/app.py
 ```
 
-### Modes of Operation
-- **Standard (Live Data)**:
-  - Upload custom internal ledgers and bank statements (CSV or XLSX).
-  - One-click **"📁 Load Sample Datasets"** for instant local exploration.
-  - Interactive **"👁️ View Active Dataset Previews"** showing live tables and row counts.
-  - **"🔄 Reset / Clear Active Data"** button to reset session state and browser uploaders.
-- **Benchmark (Ground Truth)**:
-  - Automatically loads canonical benchmark files (`data/ledger.csv` and `data/bank_statement.csv`).
-  - Evaluates engine and AI matcher performance against `data/answer_key.csv`.
-  - Displays Pair Precision, Pair Recall, F1 Score, Auto-Resolution Precision, and an interactive **2×2 Confusion Matrix** (TP, FP, FN, TN).
+### Standard mode
 
-### Complete Results Dashboard
-- **Performance Summary KPIs**: Exact batch totals and percentages (`Total Records`, `Matched`, `Review Required`, `Unmatched`, `AI Escalations`) with clean layout and no misleading trend arrows.
-- **Exception Summary Tab**: Lists ambiguous and unmatched items with explicit `resolution_guidance`.
-- **Agent Activity & Trace Tab**: Displays case intelligence, verification pass rates, and the full audit registry generated automatically upon reconciliation.
-- **Audit & CSV Export**: Download reconciled results as CSV with one click.
+- Upload ledger and bank files in CSV or XLSX format.
+- Load checked-in sample datasets.
+- Preview the active data.
+- Adjust amount/date/decision thresholds.
+- Enable or disable Groq assistance.
+- Enter a Groq key in a password field; the key is kept in **Streamlit session state**, not copied into process-global environment variables.
+- Run reconciliation.
+- Inspect matched, review, unmatched, exception, and evidence views.
+- Inspect agent cases and the full append-only audit registry.
+- Export reconciliation results and audit history as CSV.
 
----
+### Benchmark mode
 
-## 📊 Benchmark Ground-Truth Evaluation
+- Loads `data/ledger.csv` and `data/bank_statement.csv`.
+- Evaluates the exact reconciliation result against `data/answer_key.csv`.
+- Displays precision, recall, F1, coverage, review rate, AI escalation rate, and a 2×2 confusion matrix.
 
-LedgerLens includes a synthetic benchmark generator (`scripts/generate_dataset.py`) producing 225+ ledger records and 250+ bank statement records across 12 real-world scenarios:
-- `EASY_EXACT`, `NOISY_REFERENCE`, `FEE_DIFFERENCE`, `DATE_SHIFT`, `DUPLICATE_NEAR_DUPLICATE`, `AMBIGUOUS`, `FALSE_POSITIVE_TRAP`, `AMOUNT_NEAR_MATCH`, `UNMATCHED_LEDGER`, `UNMATCHED_BANK`, `REVERSAL_ADJUSTMENT`, `FEE_ONLY_SETTLEMENT`.
-
-### Benchmark Accuracy Metrics
-| Metric | Formula | Benchmark Score | Description |
-| :--- | :--- | :---: | :--- |
-| **Pair Precision** | $\frac{TP}{TP + FP}$ | **96.4%** | Accuracy of matches made |
-| **Pair Recall** | $\frac{TP}{TP + FN}$ | **100.0%** | Fraction of true matches captured |
-| **F1 Score** | $2 \cdot \frac{P \cdot R}{P + R}$ | **98.2%** | Harmonic balance of precision & recall |
-| **Auto-Resolution Precision** | $\frac{AutoTP}{AutoTP + AutoFP}$ | **96.4%** | Accuracy of deterministic rules before AI |
-| **Automated Coverage** | $\frac{Matched}{Total}$ | **73.8%** | Fraction resolved without human review |
-| **AI Escalation Rate** | $\frac{AI Calls}{Total}$ | **23.1%** | Fraction routed to Groq compound LLM |
+The agent and evaluator reuse the **same result DataFrame and the same user configuration** as the UI run; they do not secretly rerun reconciliation with default settings.
 
 ---
 
-## 🌐 REST API & Observability
+## Benchmark methodology and verified baseline
 
-Start the FastAPI server:
+The checked-in benchmark contains:
+
+- **225 ledger records**
+- **250 bank records**
+- 12 scenario classes including exact, noisy reference, fee difference, date shift, duplicates, ambiguity, false-positive traps, amount-near-match, unmatched ledger/bank, reversals, and fee-only settlements.
+
+### Correct pair accounting
+
+For pair-level metrics:
+
+- `MATCHED` is the positive prediction.
+- `REVIEW` and `UNMATCHED` are non-match predictions.
+- A true match sent to `REVIEW` is therefore a **false negative** for auto-resolution metrics; it is not silently excluded from the confusion matrix.
+
+### Reproducible CI baseline — no Groq key
+
+The GitHub Actions benchmark intentionally runs without a Groq key so external model behavior cannot make CI nondeterministic. Ambiguous cases therefore degrade safely to `REVIEW`.
+
+| Metric | Verified result |
+|---|---:|
+| Pair Precision | **88.24%** |
+| Pair Recall | **75.00%** |
+| F1 | **81.08%** |
+| Auto-Resolution Precision | **88.24%** |
+| Auto-Resolution Recall | **75.00%** |
+| Automated MATCHED Coverage | **60.44%** |
+| Review Rate | **36.00%** |
+| AI-Gate / Escalation Rate | **36.00%** |
+| False Positive Rate | **21.33%** |
+| False Negative Rate | **25.00%** |
+
+Confusion matrix:
+
+```text
+TP = 120
+FP = 16
+FN = 40
+TN = 59
+```
+
+Headline: **88.2% precision at 60.4% automated coverage**.
+
+These are the reproducible no-key baseline numbers from CI, not marketing estimates. A live Groq run may produce different match/coverage metrics depending on model behavior, API availability, and configured thresholds; rerun `python -m scripts.run_benchmark` in the target environment rather than hard-coding an unverified live-AI score.
+
+---
+
+## REST API
+
+Run:
+
 ```bash
 uvicorn app.api:app --reload --port 8000
 ```
 
 ### Endpoints
-- `GET /api/v1/health`: System status, data source, and configuration health.
-- `POST /api/v1/reconcile`: Executes reconciliation over active datasets.
-  - Supports `?debug=true` to include per-transaction evidence breakdown and AI traces.
-- `POST /api/v1/custom-data/upload`: Uploads custom ledger or bank statement files.
-- `POST /api/v1/agent/run`: Triggers the bounded agent lifecycle and returns an `AgentRunSummary`.
-- `GET /api/v1/audit`: Returns chronological `AuditEvent` history.
+
+- `GET /api/v1/health` — default/custom dataset readiness and configuration status.
+- `POST /api/v1/reconcile` — run reconciliation.
+  - `?debug=true` includes per-record evidence breakdown, candidate metadata, AI outcome summary, and deterministic safety checks.
+  - `?use_custom_data=true` requires both uploaded custom datasets; an incomplete pair returns `400` and **never silently falls back to benchmark data**.
+- `POST /api/v1/custom-data/upload` — upload a validated ledger or bank CSV/XLSX file.
+- `GET /api/v1/reconcile/{run_id}` — retrieve persisted recent reconciliation summaries (`latest` is supported by `/api/v1/reconcile/`).
+- `POST /api/v1/agent/run` — run the bounded agent lifecycle.
+- `GET /api/v1/cases` — list active agent cases.
+- `GET /api/v1/cases/{case_id}` — inspect one case.
+- `POST /api/v1/cases/{case_id}/approve` — execute an actual pending policy action when one exists; a mere `FLAG_FOR_REVIEW` cannot be “approved” into a financial action.
+- `GET /api/v1/audit` — chronological append-only audit events from the active agent run.
+
+Recent REST run summaries are stored in `data/.ledgerlens_cache.json`; this is an API run cache, while Groq decision caching is in-memory.
 
 ---
 
-## 🚀 Installation & Quickstart
+## Input schema
 
-### 1. Prerequisites
-- Python 3.10, 3.11, or 3.12 (Python 3.11 recommended).
-- Git.
+The engine validates every field it accesses directly before reconciliation.
 
-### 2. Clone & Install
+### Ledger runtime requirements
+
+- `order_id`
+- `amount`
+- `order_date`
+- `currency`
+
+Optional descriptive fields such as `customer_name` and `payment_method` improve evidence but are not required for runtime safety.
+
+### Bank runtime requirements
+
+- `utr_reference`
+- `credited_amount`
+- `value_date`
+- `currency`
+- `narration_text`
+
+`narration_text` may be empty for rails that provide no useful description, but the column must exist.
+
+---
+
+## Razorpay connector
+
+`src/connectors/razorpay.py` provides a checked-in demo adapter and canonical transaction conversion utilities for demonstrating ledger → Razorpay settlement → bank-credit flows.
+
+The demo integration is implemented and tested. **Live Razorpay settlement fetching is not implemented**; `load_live_settlements()` intentionally raises `NotImplementedError` until real credentials/API wiring are added.
+
+---
+
+## Batch aggregate detection
+
+`detect_batch_aggregates()` flags unmatched bank credits that may represent several nearby ledger orders combined into one gateway settlement. The current implementation is a bounded heuristic intended to surface candidates for review, not a proof of arbitrary subset-sum equivalence.
+
+Full optimization for large arbitrary settlement groups remains a known limitation.
+
+---
+
+## Installation
+
+Prerequisites: Python 3.10–3.12 (3.11 recommended) and Git.
+
 ```bash
 git clone https://github.com/ZigzagDeck/LedgerLens.git
 cd LedgerLens
 python -m venv venv
-source venv/bin/activate   # On Windows: venv\Scripts\activate
+```
+
+Activate the environment:
+
+```bash
+# macOS/Linux
+source venv/bin/activate
+
+# Windows PowerShell
+venv\Scripts\Activate.ps1
+```
+
+Install dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
 
-### 3. Configure Secrets
-Create a `.env` file from the provided template:
+Copy the environment template:
+
 ```bash
 cp .env.example .env
 ```
-Edit `.env` to include your Groq API key:
+
+Optional live AI configuration:
+
 ```env
 GROQ_API_KEY=gsk_your_groq_api_key_here
 GROQ_MAX_CALLS_PER_MINUTE=25
+LEDGERLENS_DEBUG_MODE=false
+LEDGERLENS_CUSTOM_DATA_DIR=data/custom
 ```
 
----
-
-## ☁️ Streamlit Cloud Deployment
-
-1. Fork or push this repository to GitHub.
-2. Sign in to [share.streamlit.io](https://share.streamlit.io/).
-3. Create a new app:
-   - **Repository**: `YourUsername/LedgerLens`
-   - **Branch**: `main`
-   - **Main file path**: `app/app.py`
-4. Under **Advanced Settings ➔ Secrets**, provide:
-   ```toml
-   GROQ_API_KEY = "gsk_your_key_here"
-   ```
-5. Deployment automatically uses Python 3.11 as specified in `.python-version`.
+Without a Groq key the system still runs; ambiguous cases safely become `REVIEW`.
 
 ---
 
-## 🛠️ Developer CLI Commands
+## Developer commands
 
 ```bash
-# Run complete test suite (62 tests)
+# Full suite — currently 73 tests
 python -m pytest -q
 
-# Generate fresh synthetic benchmark dataset
-python -m scripts.generate_dataset --seed 123 --ledger-count 200 --bank-count 200 --output-dir data
+# Syntax/compile verification
+python -m compileall -q src app api scripts tests
 
-# Verify data & source repository isolation
-python -m scripts.audit_repo
-
-# Run benchmark evaluation CLI
+# Reproducible offline benchmark
 python -m scripts.run_benchmark
 
-# Run throughput scalability benchmark (250 to 10K rows)
+# Generate benchmark data
+python -m scripts.generate_dataset --seed 123 --ledger-count 200 --bank-count 200 --output-dir data
+
+# Repository/data audit
+python -m scripts.audit_repo
+
+# Throughput benchmark
 python -m scripts.run_throughput
 ```
 
----
-
-## ⚠️ Known Limitations
-
-1. **Multi-Order Batch Settlement Detection**: Payment gateways often aggregate multiple ledger orders into a single net settlement credit. LedgerLens includes a `detect_batch_aggregates()` heuristic detector that flags nearby candidate order combinations. Full subset-sum optimization for arbitrary 10+ order combinations is under active development.
-2. **Multi-Currency Conversion**: Live foreign exchange (FX) conversion is not implemented; cross-currency pairs are safely flagged and routed to `REVIEW`.
+GitHub Actions runs dependency installation, compile checks, all tests, and the offline benchmark on fix branches and pull requests.
 
 ---
 
-## 📄 License
+## Streamlit Cloud
 
-MIT License. Designed and engineered for transparent, deterministic financial reconciliation.
+1. Push or fork the repository to GitHub.
+2. Create a Streamlit Cloud app using `app/app.py` as the main file.
+3. Use Python 3.11 (the repo includes `.python-version`).
+4. Add the optional secret in Streamlit Cloud settings:
+
+```toml
+GROQ_API_KEY = "gsk_your_key_here"
+```
+
+---
+
+## Known limitations
+
+1. **Live Razorpay API fetching:** demo/canonical adapter exists; live settlement API wiring is not implemented.
+2. **Arbitrary large batch settlements:** current aggregate detection is heuristic rather than exhaustive subset-sum optimization.
+3. **FX conversion:** live foreign-exchange conversion is not implemented; cross-currency contradictions are routed to `REVIEW`.
+4. **Live-AI benchmark reproducibility:** external model output can change. CI therefore reports a deterministic no-key baseline and live-AI metrics must be rerun in the target environment.
+
+---
+
+## Verification
+
+Current CI verification on Python 3.11:
+
+- `compileall`: passed
+- `pytest`: **73 passed**
+- offline benchmark: passed
+- answer-key isolation audit: passed
+
+---
+
+## License
+
+MIT License.

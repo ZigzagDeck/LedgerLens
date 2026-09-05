@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, asdict, field
 from typing import Dict, Any, Optional, List
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict
 
 
 @dataclass
@@ -32,7 +32,7 @@ class AIEvaluationSchema(BaseModel):
 
 @dataclass
 class ReconciliationRecord:
-    """Structured reconciliation result output record with full observability fields."""
+    """Structured reconciliation result with complete observability fields."""
     ledger_id: str
     bank_id: str
     status: str
@@ -47,6 +47,7 @@ class ReconciliationRecord:
     date_difference: int = 0
     candidate_rank: int = 0
     candidate_count: int = 0
+    evidence_breakdown: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -64,6 +65,7 @@ class ReconciliationRecord:
             "date_difference": self.date_difference,
             "candidate_rank": self.candidate_rank,
             "candidate_count": self.candidate_count,
+            "evidence_breakdown": dict(self.evidence_breakdown or {}),
         }
 
 
